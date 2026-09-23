@@ -14,9 +14,11 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -c "import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)"
+python -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3,14) else 1)"
 if errorlevel 1 (
-    echo [ERROR] Python 3.12 or later is required.
+    echo [ERROR] Python 3.14 is required. Older versions and newer versions such as 3.15 are not supported.
+    echo [ERROR] If multiple Python versions are installed, make sure 3.14 is first on PATH.
+    python --version
     pause
     exit /b 1
 )

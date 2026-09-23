@@ -22,7 +22,7 @@ Gmail に届いた添付ファイルを、Windows PC の指定フォルダー（
 ## 動作環境
 
 - Windows 10 / 11
-- Python 3.12 以上（3.14 で動作確認）
+- Python 3.14 専用。3.13 以下・3.15 以上は対応せず、setup.bat が停止する
 - Gmail API を有効化した Google Cloud プロジェクト（利用者自身が用意する）
 
 ## 導入

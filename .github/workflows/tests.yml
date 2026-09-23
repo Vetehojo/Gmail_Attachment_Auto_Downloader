@@ -12,8 +12,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.12 はサポート下限、3.14 は実際に配布・運用する版。
-        python-version: ["3.12", "3.14"]
+        # 3.14 がサポート・テスト対象のバージョン。
+        python-version: ["3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

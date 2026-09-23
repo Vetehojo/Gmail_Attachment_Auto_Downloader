@@ -11,15 +11,16 @@ echo  Gmail Auto Downloader Setup
 echo ============================================
 echo.
 
-echo [1/3] Checking Python 3.12+...
+echo [1/3] Checking Python 3.14...
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] Python not found. Install Python 3.12+ and enable Add Python to PATH.
+    echo [ERROR] Python not found. Install Python 3.14 and enable Add Python to PATH.
     goto :END_ERROR
 )
-python -c "import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)"
+python -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3,14) else 1)"
 if errorlevel 1 (
-    echo [ERROR] Python 3.12 or later is required.
+    echo [ERROR] Python 3.14 is required. Older versions and newer versions such as 3.15 are not supported.
+    echo [ERROR] If multiple Python versions are installed, make sure 3.14 is first on PATH.
     python --version
     goto :END_ERROR
 )

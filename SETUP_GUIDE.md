@@ -12,7 +12,7 @@
 ## 前提
 
 - Windows 10 / 11
-- Python 3.12 以上（`Add Python to PATH` を有効化）
+- Python 3.14 専用（`Add Python to PATH` を有効化）。3.13 以下・3.15 以上は対応せず、setup.bat が停止する
 - Gmail APIを有効化したGoogle Cloudプロジェクト
 - 認証方式に応じたJSON
   - OAuth: デスクトップアプリ用OAuthクライアントJSON
@@ -207,7 +207,7 @@ worker
 
 ## テスト
 
-GitHub ActionsのWindows / Python 3.12・3.14で `tests/` 配下の全テスト(`python -m unittest discover -s tests -v`)を確認する。
+GitHub ActionsのWindows / Python 3.14で、runtime moduleのcompile checkと `tests/` 配下の全テスト(`python -m unittest discover -s tests -v`)を実行し、主に次を確認する。
 
 - runtime module compile
 - Gmail pagination
