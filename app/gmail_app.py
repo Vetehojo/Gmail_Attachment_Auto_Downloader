@@ -33,6 +33,9 @@ from filename_rules import preview_filename, validate_template
 from job_queue import JobQueue
 from runtime_state import (
     AUTH_ISSUES_KEY,
+    WORKER_HEARTBEAT_KEY,
+    WORKER_IDLE_STALL_SECONDS,
+    WORKER_STALL_SECONDS,
     SingleInstance,
     append_log,
     begin_settings_update,
@@ -60,11 +63,10 @@ PAUSED_KEY = "monitor_paused"
 PAUSE_REASON_KEY = "monitor_pause_reason"
 PAUSE_STARTUP_NOTICE = "自動取得は一時停止中です。トレイメニューの「一時停止 / 再開」で再開できます。"
 LAST_ERROR_KEY = "monitor_last_error"
-# Keys written by gmail_monitor's worker thread (see C3 in PR32 contract).
-# Redefined here rather than imported so the tray process never has to pull
-# in gmail_monitor's heavier dependencies (google-api-python-client) just to
-# read two SQLite metadata key names.
-WORKER_HEARTBEAT_KEY = "worker_heartbeat"
+# Written by gmail_monitor's worker thread (see C3 in PR32 contract); the
+# heartbeat key comes from runtime_state. Redefined here rather than imported
+# so the tray process never has to pull in gmail_monitor's heavier
+# dependencies (google-api-python-client) just to read a metadata key name.
 WORKER_ERROR_KEY = "worker_last_error"
 _QUEUE_INSTANCE = None
 
@@ -358,6 +360,8 @@ class MonitorController:
         return True
 
     def stop_all(self):
+        """False when the monitor could not be confirmed stopped (cause logged).
+        Used by settings save, pause, exit and 今すぐGmailを確認."""
         if os.name == "nt":
             try:
                 windows_integration.stop_owned_monitors(
@@ -366,8 +370,8 @@ class MonitorController:
                     windows_integration.taskkill_path(),
                     MONITOR_SCRIPT,
                 )
-            except windows_integration.IntegrationError as exc:
-                log(f"Monitor stop failed: {exc}", "settings")
+            except (windows_integration.IntegrationError, OSError) as exc:
+                log(f"Monitor stop failed: {exc}", "monitor")
                 return False
         elif self.process is not None and self.process.poll() is None:
             try:
@@ -1181,26 +1185,33 @@ class TrayApp:
     def _worker_issue(self, counts):
         """Reason string when the attachment worker thread looks dead/stalled, else "".
 
-        Mirrors contract C3: WORKER_ERROR_KEY non-empty, or pending jobs exist
-        while WORKER_HEARTBEAT_KEY is missing or older than 300 seconds. This
-        catches a worker thread that died silently, which otherwise leaves
-        counts["failed"] == 0 and monitor_error empty forever while pending grows.
+        Mirrors contract C3: WORKER_ERROR_KEY non-empty, or jobs are waiting
+        or processing while WORKER_HEARTBEAT_KEY is missing or too old. This
+        catches a worker thread that died silently or hangs in one job, which
+        otherwise leaves counts["failed"] == 0 and monitor_error empty forever.
+        While a job is processing, one download may legitimately take up to
+        WORKER_STALL_SECONDS without a heartbeat; with jobs only waiting, the
+        idle loop keeps it within WORKER_IDLE_STALL_SECONDS. The text depends
+        only on the last heartbeat, so it stays the same (one notification)
+        while the counts change during one stall.
         """
         q = queue()
         worker_error = q.get_metadata(WORKER_ERROR_KEY, "") or ""
         if worker_error:
             return worker_error
-        pending = counts.get("pending", 0)
-        if pending > 0:
-            raw = q.get_metadata(WORKER_HEARTBEAT_KEY)
-            age = None
-            if raw is not None:
-                try:
-                    age = time.time() - float(raw)
-                except (TypeError, ValueError):
-                    age = None
-            if raw is None or age is None or age > 300:
-                return f"添付の保存処理が応答していません（未処理 {pending}件）"
+        if counts.get("processing", 0) > 0:
+            limit = WORKER_STALL_SECONDS
+        elif counts.get("pending", 0) > 0:
+            limit = WORKER_IDLE_STALL_SECONDS
+        else:
+            return ""
+        raw = q.get_metadata(WORKER_HEARTBEAT_KEY)
+        try:
+            age = time.time() - float(raw)
+        except (TypeError, ValueError):
+            return "添付の保存処理が応答していません（応答の記録がありません）"
+        if age > limit:
+            return f"添付の保存処理が応答していません（最後の応答: {format_time(raw)}）"
         return ""
 
     def _health_tick(self):

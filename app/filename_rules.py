@@ -10,7 +10,7 @@ DEFAULT_SUBJECT_MAX = 50
 _ALLOWED_FIELDS = {"original", "date", "subject", "sender"}
 
 MAX_WINDOWS_PATH = 259          # MAX_PATH (260) minus the terminating NUL
-TEMP_NAME_RESERVE = 24          # worst case ".gmailad_<job id>.tmp"
+TEMP_NAME_RESERVE = 24          # worst case of gmail_monitor.temp_file_name: ".gad<install id>_<job id, base 36>"
 RESERVED_STEMS = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
 
 

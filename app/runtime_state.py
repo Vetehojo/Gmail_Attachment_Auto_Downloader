@@ -38,6 +38,17 @@ IDENTITY_KEY_PREFIX = "verified_identity:"
 # shown by the tray as 要確認; an account's entry is cleared when one of its
 # jobs succeeds, and every entry when settings are saved.
 AUTH_ISSUES_KEY = "monitor_auth_issues"
+# Time of the monitor's attachment worker's last sign of life: the monitor
+# start, its idle loop (gmail_monitor.WORKER_HEARTBEAT_INTERVAL) and each step
+# of a job (claimed, fetched, placed, verified). Nothing is written while one
+# download is in progress, so while a job is processing it may legitimately be
+# as old as one attachment download (up to 100MB) takes: WORKER_STALL_SECONDS.
+# With jobs only waiting, the idle loop keeps it within WORKER_IDLE_STALL_SECONDS.
+# The tray warns past these; the watchdog restarts the monitor when jobs wait
+# or process and it stays older than WORKER_STALL_SECONDS.
+WORKER_HEARTBEAT_KEY = "worker_heartbeat"
+WORKER_STALL_SECONDS = 15 * 60
+WORKER_IDLE_STALL_SECONDS = 300
 
 
 def begin_settings_update(queue, now=None):

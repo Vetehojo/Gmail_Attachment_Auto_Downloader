@@ -289,7 +289,20 @@ class SaveOrderTest(SaveTestBase):
                                side_effect=integration.IntegrationError("identity changed")):
             self.assertFalse(gmail_app.MonitorController().stop_all())
         with open(os.path.join(self.root, "log", "tray_log.txt"), encoding="utf-8") as handle:
-            self.assertIn("Monitor stop failed: identity changed", handle.read())
+            text = handle.read()
+        self.assertIn("Monitor stop failed: identity changed", text)
+        # stop_all also serves pause, exit and 今すぐGmailを確認: a neutral label.
+        self.assertIn("- monitor: Monitor stop failed", text)
+
+    def test_monitor_stop_os_error_is_logged_and_reported_as_not_stopped(self):
+        integration = gmail_app.windows_integration
+        with mock.patch.object(gmail_app.os, "name", "nt"), \
+             mock.patch.object(integration, "Runner"), \
+             mock.patch.object(integration, "stop_owned_monitors",
+                               side_effect=FileNotFoundError(2, "powershell.exe not found")):
+            self.assertFalse(gmail_app.MonitorController().stop_all())
+        with open(os.path.join(self.root, "log", "tray_log.txt"), encoding="utf-8") as handle:
+            self.assertIn("- monitor: Monitor stop failed: [Errno 2] powershell.exe not found", handle.read())
 
     def test_commit_failure_restarts_and_reports(self):
         dialog = self.make_dialog(final=self.final)

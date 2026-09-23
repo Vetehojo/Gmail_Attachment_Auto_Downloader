@@ -10,6 +10,8 @@ import base64
 import hashlib
 import json
 import os
+import re
+import secrets
 import sys
 import threading
 import time
@@ -21,6 +23,7 @@ from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
 from app_settings import (
+    APP_DATA_DIR,
     AUTH_DWD,
     BASE_DIR,
     credential_file_digest,
@@ -35,6 +38,7 @@ from filename_rules import filename_budget, render_filename
 from gmail_auth import AccountNotConfiguredError, AuthenticationRequiredError, get_gmail_service
 from job_queue import JobQueue
 from runtime_state import (
+    WORKER_HEARTBEAT_KEY,
     SingleInstance,
     append_log,
     atomic_write_json,
@@ -56,15 +60,30 @@ TRAY_MUTEX_NAME = "Local\\GmailAutoDownloaderTray"
 MAIL_CURSOR_KEY = "mail_cursor_timestamp"
 RETENTION_KEY = "jobs_retention_last_run"
 LAST_ERROR_KEY = "monitor_last_error"
-WORKER_HEARTBEAT_KEY = "worker_heartbeat"
 WORKER_ERROR_KEY = "worker_last_error"
 WORKER_HEARTBEAT_INTERVAL = 15
 QUERY_OVERLAP = timedelta(minutes=5)
 AUTH_DEFER_SECONDS = 15 * 60
 MAX_JOBS_PER_ONCE = 20
 MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024
-TEMP_PREFIX = ".gmailad_"
-TEMP_SUFFIX = ".tmp"
+# Temp files are ".gad<install id>_<job id in base 36>": at most 4 + 6 + 1 + 13
+# = 24 characters (filename_rules.TEMP_NAME_RESERVE) for any SQLite row id.
+# The install id keeps installations that share a save folder apart, and the
+# format is never matched by the cleanup of versions without it, which
+# removed every ".gmailad_*.tmp" (LEGACY_TEMP_PREFIX/SUFFIX).
+TEMP_PREFIX = ".gad"
+INSTALL_ID_LENGTH = 6
+INSTALL_ID_FILE = os.path.join(APP_DATA_DIR, "install_id")
+LEGACY_TEMP_PREFIX = ".gmailad_"
+LEGACY_TEMP_SUFFIX = ".tmp"
+# Another installation's (or a pre-install-id version's) temp may be one it is
+# writing right now; only one this old is treated as left behind.
+FOREIGN_TEMP_MAX_AGE = 24 * 60 * 60
+MAX_PLACEMENT_ATTEMPTS = 5
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+_INSTALL_ID_RE = re.compile(f"[0-9a-z]{{{INSTALL_ID_LENGTH}}}")
+_TEMP_NAME_RE = re.compile(f"{re.escape(TEMP_PREFIX)}([0-9a-z]{{{INSTALL_ID_LENGTH}}})_[0-9a-z]{{1,13}}")
+_INSTALL_IDS = {}
 TRIAL_DEFAULT_MESSAGES = 3
 TRIAL_MAX_MESSAGES = 20
 TRIAL_SCAN_CAP = 100
@@ -514,12 +533,87 @@ def _unique_path(path):
     return f"{base}({counter}){ext}"
 
 
-def _write_bytes_atomic(data, target_path, tag):
+def _read_install_id(path):
+    """The stored id, or None when the file is missing or does not hold one."""
+    try:
+        with open(path, "r", encoding="ascii", errors="replace") as handle:
+            value = handle.read().strip().lower()
+    except FileNotFoundError:
+        return None
+    return value if _INSTALL_ID_RE.fullmatch(value) else None
+
+
+def installation_id():
+    """This installation's id in temp file names: INSTALL_ID_LENGTH random
+    base-36 characters, created on first use and kept in INSTALL_ID_FILE under
+    %LOCALAPPDATA%, not state/, so a copied install folder never shares it. A
+    read error other than a missing file propagates (the job retries)."""
+    path = INSTALL_ID_FILE
+    cached = _INSTALL_IDS.get(path)
+    if cached:
+        return cached
+    value = _read_install_id(path)
+    if value is None:
+        new_id = "".join(secrets.choice(_BASE36) for _ in range(INSTALL_ID_LENGTH))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, "x", encoding="ascii") as handle:
+                handle.write(new_id)
+        except FileExistsError:
+            # Created meanwhile by another process of this installation, or
+            # present without a valid id (then it is replaced).
+            value = _read_install_id(path)
+            if value is None:
+                log(f"Replacing an invalid installation id file: {path}", "main")
+                with open(path, "w", encoding="ascii") as handle:
+                    handle.write(new_id)
+        if value is None:
+            value = new_id
+    _INSTALL_IDS[path] = value
+    return value
+
+
+def _base36(number):
+    number = int(number)
+    if number < 0:
+        raise ValueError(f"job id must not be negative: {number}")
+    digits = ""
+    while True:
+        number, remainder = divmod(number, 36)
+        digits = _BASE36[remainder] + digits
+        if not number:
+            return digits
+
+
+def temp_file_name(job_id, install_id=None):
+    """Fixed-form temp name: never scales with the (already budgeted) final
+    filename, so it cannot push a legal final path over MAX_PATH."""
+    return f"{TEMP_PREFIX}{install_id or installation_id()}_{_base36(job_id)}"
+
+
+def _rename_no_replace(source, target):
+    """Move source to target; FileExistsError when target exists, never replace it.
+
+    Windows os.rename is MoveFileExW without MOVEFILE_REPLACE_EXISTING: it
+    fails with ERROR_ALREADY_EXISTS on NTFS (also for a name differing only in
+    case) and, on an SMB share, when the server reports a name collision.
+    POSIX rename() would replace, so link + unlink there.
+    """
+    if os.name == "nt":
+        os.rename(source, target)
+    else:
+        os.link(source, target)
+        os.remove(source)
+
+
+def _write_bytes_atomic(data, target_path, job_id):
+    """Write data under this installation's temp name next to target_path and
+    move it into place. Never replaces an existing file: FileExistsError when
+    target_path was taken (e.g. by another installation saving into the same
+    folder) after it was chosen."""
     target_dir = os.path.dirname(target_path)
     os.makedirs(target_dir, exist_ok=True)
-    # Fixed-length temp name: never scales with the (already budgeted) final
-    # filename, so it cannot push a legal final path over MAX_PATH.
-    temp = os.path.join(target_dir, f"{TEMP_PREFIX}{tag}{TEMP_SUFFIX}")
+    temp = os.path.join(target_dir, temp_file_name(job_id))
     try:
         with open(temp, "wb") as handle:
             handle.write(data)
@@ -528,22 +622,32 @@ def _write_bytes_atomic(data, target_path, tag):
                 os.fsync(handle.fileno())
             except OSError:
                 pass
-        os.replace(temp, target_path)
+        _rename_no_replace(temp, target_path)
     finally:
         try:
             os.remove(temp)
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError as exc:
+            log(f"Could not remove temp file {temp}: {exc}", "worker")
 
 
 def cleanup_orphan_temp_files(final_dirs):
-    """Remove *.tmp left by a killed monitor. Returns how many were removed.
+    """Remove temp files left by a killed save. Returns how many were removed.
 
-    SingleInstance guarantees one monitor, and this runs before any write, so
-    deleting every matching temp at startup is safe. Only entries matching
-    TEMP_PREFIX + TEMP_SUFFIX are touched; every per-file OSError is ignored
-    so one locked/missing file cannot abort the sweep.
+    Runs at startup while holding the monitor lock, before any write, so every
+    temp of this installation is left over and removed. A save folder may be
+    shared with other installations (other PCs), whose temps -- and those of
+    versions before installation ids (".gmailad_*.tmp") -- are removed only
+    when older than FOREIGN_TEMP_MAX_AGE. Nothing else is touched; an OSError
+    is logged and does not abort the sweep or the startup.
     """
+    try:
+        own_id = installation_id()
+    except OSError as exc:
+        log(f"Installation id unavailable; removing only temp files older than 24 hours: {exc}", "cleanup")
+        own_id = None
+    now = time.time()
     removed = 0
     seen = set()
     for final_dir in final_dirs or []:
@@ -558,13 +662,19 @@ def cleanup_orphan_temp_files(final_dirs):
         except OSError:
             continue
         for name in entries:
-            if not (name.startswith(TEMP_PREFIX) and name.endswith(TEMP_SUFFIX)):
+            match = _TEMP_NAME_RE.fullmatch(name)
+            legacy = name.startswith(LEGACY_TEMP_PREFIX) and name.endswith(LEGACY_TEMP_SUFFIX)
+            if not (match or legacy):
                 continue
+            path = os.path.join(final_dir, name)
             try:
-                os.remove(os.path.join(final_dir, name))
+                if not (match and match.group(1) == own_id):
+                    if now - os.path.getmtime(path) < FOREIGN_TEMP_MAX_AGE:
+                        continue
+                os.remove(path)
                 removed += 1
-            except OSError:
-                pass
+            except OSError as exc:
+                log(f"Could not remove orphan temp file {path}: {exc}", "cleanup")
     return removed
 
 
@@ -627,8 +737,17 @@ def _fresh_target_path(payload, final_dir):
     return _unique_path(os.path.join(final_dir, filename))
 
 
-def run_attachment_job(job_id, service, payload):
+def run_attachment_job(job_id, service, payload, beat=None):
+    """Save one attachment. The prepared journal pins the target name before
+    anything is written; a crash at any point is resumed from it (or
+    reconciled by recover_interrupted_jobs). The file is placed without ever
+    replacing an existing one: when the pinned name was taken meanwhile, a
+    prepared job moves to a fresh name, journaled before each attempt, while a
+    committed or legacy journal stops with an error. `beat` (the monitor's
+    worker heartbeat) is called after each step: fetched, placed, verified."""
+    beat = beat or (lambda: None)
     file_data = _attachment_bytes(service, payload)
+    beat()
     if len(file_data) > MAX_ATTACHMENT_SIZE:
         raise RuntimeError("添付ファイルが100MB上限を超えています。")
     file_hash = hashlib.sha256(file_data).hexdigest()
@@ -661,27 +780,55 @@ def run_attachment_job(job_id, service, payload):
     if _file_matches(target_path, file_hash):
         atomic_write_json(marker_path, {"success": True, "phase": "committed", "result": result})
         return result
-    if os.path.exists(target_path):
+
+    def relocate():
         # A save interrupted after "prepared" never wrote the pinned name, so
-        # another job may have taken it since. Only when _file_matches really
-        # hashed that file (a read error propagates and the job retries) move
-        # to a fresh name from the rendered base -- not name(1)(1) -- and
-        # persist it before writing. Committed or legacy journals still stop.
-        if not (prepared and os.path.isfile(target_path)):
+        # another job -- or another installation saving into the same folder
+        # -- may have taken it since. Move to a fresh name from the rendered
+        # base (not name(1)(1)) and persist it before writing. Committed or
+        # legacy journals still stop.
+        nonlocal target_path, result
+        if not prepared:
             raise RuntimeError(f"保存予定先に別内容のファイルが存在します: {target_path}")
         target_path = _fresh_target_path(payload, final_dir)
         result = dict(result, saved_filename=os.path.basename(target_path), target_path=target_path)
         atomic_write_json(marker_path, {"success": False, "phase": "prepared", "result": result})
 
-    _write_bytes_atomic(file_data, target_path, job_id)
+    if os.path.exists(target_path):
+        # Only when _file_matches really hashed that file (a read error
+        # propagates and the job retries) is it a different file.
+        if not os.path.isfile(target_path):
+            raise RuntimeError(f"保存予定先に別内容のファイルが存在します: {target_path}")
+        relocate()
+
+    for _attempt in range(MAX_PLACEMENT_ATTEMPTS):
+        try:
+            _write_bytes_atomic(file_data, target_path, job_id)
+            break
+        except FileExistsError:
+            # Taken between the name check and the move; any other OSError
+            # goes to the normal job retry with the journal unchanged.
+            log(f"Attachment job {job_id}: {os.path.basename(target_path)} was taken meanwhile", "worker")
+            relocate()
+    else:
+        raise RuntimeError(
+            f"保存先で同じ名前のファイルが続けて作られたため、保存できませんでした（{MAX_PLACEMENT_ATTEMPTS}回）: {target_path}"
+        )
+    beat()
     if not _file_matches(target_path, file_hash):
         raise RuntimeError("添付ファイル保存後のSHA-256検証に失敗しました。")
+    beat()
     atomic_write_json(marker_path, {"success": True, "phase": "committed", "result": result})
     return result
 
 
 def reconcile_completed_jobs(queue):
-    """Reconcile filesystem side effects without resurrecting failed/ignored jobs."""
+    """Reconcile filesystem side effects without resurrecting failed/ignored jobs.
+
+    Each journal is checked on its own: an error while checking one (e.g. its
+    saved file cannot be read) is logged, the journal is kept and the job is
+    left to the normal retry, so one bad file cannot stop the monitor start.
+    """
     os.makedirs(STATE_DIR, exist_ok=True)
     reconciled = 0
     for name in os.listdir(STATE_DIR):
@@ -690,28 +837,35 @@ def reconcile_completed_jobs(queue):
         id_text = name[len("attachmentjob_"):-len(".json")]
         if not id_text.isdigit():
             continue
-        path = os.path.join(STATE_DIR, name)
-        job_id = int(id_text)
-        job = queue.get_job(job_id)
-        if job is None or job["status"] == "success":
+        try:
+            reconciled += _reconcile_journal(queue, int(id_text), os.path.join(STATE_DIR, name))
+        except Exception as exc:
+            log(f"Could not reconcile attachment job {id_text}; it stays for the normal retry: {exc}", "queue")
+    return reconciled
+
+
+def _reconcile_journal(queue, job_id, path):
+    """1 when the journal's saved file completed the job, else 0."""
+    job = queue.get_job(job_id)
+    if job is None or job["status"] == "success":
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return 0
+    if job["status"] == "failed" or job["ignored"]:
+        return 0
+    data = _load_json(path) or {}
+    result = data.get("result") or {}
+    if _file_matches(result.get("target_path", ""), result.get("hash", "")):
+        result.setdefault("account_email", job.get("payload", {}).get("account_email", ""))
+        if queue.mark_success(job_id, result):
             try:
                 os.remove(path)
             except OSError:
                 pass
-            continue
-        if job["status"] == "failed" or job["ignored"]:
-            continue
-        data = _load_json(path) or {}
-        result = data.get("result") or {}
-        if _file_matches(result.get("target_path", ""), result.get("hash", "")):
-            result.setdefault("account_email", job.get("payload", {}).get("account_email", ""))
-            if queue.mark_success(job_id, result):
-                reconciled += 1
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-    return reconciled
+            return 1
+    return 0
 
 
 def _is_auth_error(exc):
@@ -742,14 +896,29 @@ def _write_failure_notice(job, error):
         pass
 
 
+def _worker_beat(queue):
+    """Write the worker heartbeat (runtime_state.WORKER_HEARTBEAT_KEY). A
+    failed write is logged and never fails the job in progress."""
+    try:
+        queue.set_metadata(WORKER_HEARTBEAT_KEY, time.time())
+    except Exception as exc:
+        log(f"Worker heartbeat write failed: {exc}", "worker")
+
+
 def process_one_job(queue, pool):
-    """The monitor's worker path. Besides the job itself it keeps the tray's
-    authentication issues current (runtime_state.AUTH_ISSUES_KEY); the trial
-    calls run_claimed_job directly and leaves them alone."""
+    """The monitor's worker path. Besides the job itself it keeps the worker
+    heartbeat (at every step of the job) and the tray's authentication issues
+    (runtime_state.AUTH_ISSUES_KEY) current; the trial calls run_claimed_job
+    directly and leaves both alone."""
     job = queue.claim_next()
     if job is None:
         return False
-    outcome, detail = run_claimed_job(queue, pool, job)
+
+    def beat():
+        _worker_beat(queue)
+
+    beat()
+    outcome, detail = run_claimed_job(queue, pool, job, beat)
     account_email = _account_id((job.get("payload") or {}).get("account_email"))
     if outcome == "deferred":
         set_auth_issue(queue, account_email, detail)
@@ -758,12 +927,12 @@ def process_one_job(queue, pool):
     return True
 
 
-def run_claimed_job(queue, pool, job):
+def run_claimed_job(queue, pool, job, beat=None):
     """Save one claimed job and record the outcome through the normal
     success/failure path. Returns (outcome, detail): ("success", result),
     ("deferred", error) for authentication, ("failed", error) at once for an
     account that is no longer configured, or (mark_failure's disposition,
-    error)."""
+    error). `beat` goes to run_attachment_job."""
     payload = job.get("payload") or {}
     account_email = _account_id(payload.get("account_email"))
     try:
@@ -771,7 +940,7 @@ def run_claimed_job(queue, pool, job):
         # the claimed job through mark_failure instead of leaving it processing.
         write_heartbeat(HEARTBEAT_FILE, "ok", f"attachment job {job['id']}: {account_email}", log_path=LOG_FILE)
         service = pool.get(account_email)
-        result = run_attachment_job(job["id"], service, payload)
+        result = run_attachment_job(job["id"], service, payload, beat)
         if not queue.mark_success(job["id"], result):
             raise RuntimeError("job state changed before success could be recorded")
         try:
@@ -814,10 +983,11 @@ def worker_loop(queue, stop_event):
     Without that, a construction-time exception (e.g. a misconfigured
     account) would silently kill this thread while the scanner kept writing
     heartbeats and pending jobs piled up with every indicator still green.
-    WORKER_HEARTBEAT_KEY is refreshed at most once per
-    WORKER_HEARTBEAT_INTERVAL seconds, far inside the 300s staleness budget
-    the tray checks against; WORKER_ERROR_KEY is cleared on a normal start
-    and set only when this function is about to exit.
+    While idle, WORKER_HEARTBEAT_KEY is refreshed at most once per
+    WORKER_HEARTBEAT_INTERVAL seconds, far inside
+    runtime_state.WORKER_IDLE_STALL_SECONDS; process_one_job refreshes it at
+    every step of a job. WORKER_ERROR_KEY is cleared on a normal start and set
+    only when this function is about to exit.
     """
     try:
         pool = ServicePool(queue)
@@ -828,7 +998,7 @@ def worker_loop(queue, stop_event):
             # Idle iterations are 2s apart. Writing the heartbeat on every one
             # would be ~43k pointless SQLite writes a day and needless lock
             # contention with the scanner thread's enqueue; 15s is far inside
-            # the 300s staleness budget the tray checks against.
+            # the staleness budget the tray and the watchdog check against.
             if now - last_beat >= WORKER_HEARTBEAT_INTERVAL:
                 queue.set_metadata(WORKER_HEARTBEAT_KEY, now)
                 last_beat = now
@@ -1282,6 +1452,10 @@ def main():
     worker = None
     try:
         queue = JobQueue(QUEUE_DB)
+        # A just-started monitor counts as a live worker: the heartbeat left by
+        # a stopped one (e.g. before a pause) must not make the tray or the
+        # watchdog report a stall during the startup work below.
+        _worker_beat(queue)
         recover_interrupted_jobs(queue)
         maybe_apply_retention(queue, force=True)
 

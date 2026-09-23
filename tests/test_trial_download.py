@@ -494,8 +494,9 @@ class TrialRerunTest(TrialTestBase):
         other = os.path.join(self.temp.name, "not_configured")
         os.makedirs(self.final)
         os.makedirs(other)
+        temp_name = gmail_monitor.temp_file_name(7)
         for folder in (self.final, other):
-            with open(os.path.join(folder, ".gmailad_7.tmp"), "wb") as handle:
+            with open(os.path.join(folder, temp_name), "wb") as handle:
                 handle.write(b"partial")
         gmail = FakeGmail([])
         self.use_pool(FakePool({self.ACCOUNT: gmail}))
@@ -517,8 +518,8 @@ class TrialRerunTest(TrialTestBase):
 
         self.assertEqual(gmail_monitor.TRIAL_EXIT_OK, code)
         self.assertEqual(["recover", ("cleanup", [os.path.abspath(self.final)])], order)
-        self.assertFalse(os.path.exists(os.path.join(self.final, ".gmailad_7.tmp")))
-        self.assertTrue(os.path.exists(os.path.join(other, ".gmailad_7.tmp")))
+        self.assertFalse(os.path.exists(os.path.join(self.final, temp_name)))
+        self.assertTrue(os.path.exists(os.path.join(other, temp_name)))
 
     def test_ctrl_c_before_the_file_write_then_rerun_saves_once(self):
         gmail = FakeGmail([("m1", message_payload("newest", [("a.pdf", "att1")]))])

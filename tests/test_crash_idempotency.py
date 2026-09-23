@@ -226,8 +226,8 @@ class CrashIdempotencyTest(unittest.TestCase):
                 return real_open(path, *args, **kwargs)
 
             with mock.patch("builtins.open", side_effect=spy_open):
-                gmail_monitor._write_bytes_atomic(b"1", short_target, "tagtag")
-                gmail_monitor._write_bytes_atomic(b"2", long_target, "tagtag")
+                gmail_monitor._write_bytes_atomic(b"1", short_target, 42)
+                gmail_monitor._write_bytes_atomic(b"2", long_target, 42)
 
             temp_names = [
                 os.path.basename(p) for p in opened
@@ -235,7 +235,7 @@ class CrashIdempotencyTest(unittest.TestCase):
             ]
             self.assertEqual(2, len(temp_names))
             self.assertEqual(temp_names[0], temp_names[1])
-            self.assertEqual(f"{gmail_monitor.TEMP_PREFIX}tagtag{gmail_monitor.TEMP_SUFFIX}", temp_names[0])
+            self.assertEqual(gmail_monitor.temp_file_name(42), temp_names[0])
             self.assertTrue(os.path.isfile(short_target))
             self.assertTrue(os.path.isfile(long_target))
 
@@ -302,6 +302,52 @@ class CrashIdempotencyTest(unittest.TestCase):
             current = queue.get_job(job["id"])
             self.assertEqual("failed", current["status"])
             self.assertTrue(current["ignored"])
+
+    def test_unreadable_saved_file_does_not_stop_startup_reconciliation(self):
+        # K3 / probe startup_reconciliation_read_error: hashing one job's saved
+        # file fails. That journal is kept and its job stays for the normal
+        # retry, the other job is still reconciled, and startup continues.
+        data = b"saved-before-marker"
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, "state")
+            final = os.path.join(td, "final")
+            os.makedirs(state)
+            os.makedirs(final)
+            queue = JobQueue(os.path.join(state, "jobs.sqlite3"))
+            queue.enqueue("attachment:a:m1:x", self.payload(final, "m1"))
+            queue.enqueue("attachment:a:m2:x", self.payload(final, "m2"))
+            locked_job = queue.claim_next()
+            done_job = queue.claim_next()
+            locked = os.path.join(final, "locked.pdf")
+            done = os.path.join(final, "done.pdf")
+            for path in (locked, done):
+                with open(path, "wb") as handle:
+                    handle.write(data)
+            locked_journal = self.write_journal(state, locked_job["id"], locked, data)
+            done_journal = self.write_journal(state, done_job["id"], done, data)
+            real_sha256 = gmail_monitor._sha256_file
+
+            def read_denied(path):
+                if os.path.abspath(path) == os.path.abspath(locked):
+                    raise PermissionError(13, "simulated read denial", path)
+                return real_sha256(path)
+
+            logged = []
+            with mock.patch.object(gmail_monitor, "STATE_DIR", state), \
+                 mock.patch.object(gmail_monitor, "_sha256_file", side_effect=read_denied), \
+                 mock.patch.object(gmail_monitor, "log",
+                                   lambda message, procedure="monitor": logged.append(message)):
+                gmail_monitor.recover_interrupted_jobs(queue)
+
+            self.assertEqual("success", queue.get_job(done_job["id"])["status"])
+            self.assertFalse(os.path.exists(done_journal))
+            retry = queue.get_job(locked_job["id"])
+            self.assertEqual("pending", retry["status"])
+            self.assertEqual(0, retry["attempts"])
+            self.assertTrue(os.path.exists(locked_journal))
+            self.assertTrue(any(
+                f"job {locked_job['id']}" in line and "simulated read denial" in line for line in logged
+            ))
 
     def test_authentication_outage_defers_job_without_consuming_attempts(self):
         with tempfile.TemporaryDirectory() as td:
