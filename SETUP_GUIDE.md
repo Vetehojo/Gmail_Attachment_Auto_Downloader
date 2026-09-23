@@ -341,7 +341,7 @@ Pythonファイルをフォルダー直下に置いていた版から更新す�
 1. トレイメニューの「終了（自動取得を停止）」でトレイアプリを終了する。旧トレイが動いたままだと、新しいトレイは多重起動防止により何もせず終了する
 2. タスクスケジューラで `Gmail Auto Downloader Monitor` と `Gmail Auto Downloader Watchdog` を削除する。旧構成のタスクは管理者として実行したウィンドウから登録されているため、削除を拒否されたときは、タスクスケジューラを管理者として実行してから削除する
 3. 新しい版のファイルを展開する。次のどちらかにする
-   - 今のフォルダーに上書きで展開し、旧構成だけにあったファイルを削除する。フォルダー直下の `app_settings.py`・`filename_rules.py`・`gmail_app.py`・`gmail_auth.py`・`gmail_monitor.py`・`job_queue.py`・`runtime_state.py`・`watchdog.py`・`windows_integration.py`・`reset_cursor.py`・`start_monitor.bat`・`stop_monitor.bat`・`start_test.bat`・`test_latest_attachment_download.bat`・`reset_last_check.bat`・`install_requirements.bat` と、`tests\run_virtual_download_test.bat`。フォルダー直下の古い `start_monitor.bat` を実行すると、新しいトレイとwatchdogが認識しない古い監視プロセスが起動する
+   - 今のフォルダーに上書きで展開し、旧構成だけにあったファイルを削除する。フォルダー直下の `app_settings.py`・`filename_rules.py`・`gmail_app.py`・`gmail_auth.py`・`gmail_monitor.py`・`job_queue.py`・`runtime_state.py`・`watchdog.py`・`windows_integration.py`・`reset_cursor.py`・`start_monitor.bat`・`stop_monitor.bat`・`start_test.bat`・`test_latest_attachment_download.bat`・`reset_last_check.bat`・`install_requirements.bat`・`setup.bat` と、`tests\run_virtual_download_test.bat`。フォルダー直下の古い `start_monitor.bat` を実行すると、新しいトレイとwatchdogが認識しない古い監視プロセスが起動する。古い `setup.bat`（新しい版では `1_setup.bat`）を実行すると、`requirements.lock` の固定版ではない依存パッケージが入る
    - 新しいフォルダーに展開し、古いフォルダーから `config.ini` と `state\` フォルダーをコピーする。`state\` をコピーしないと処理キューとメールの確認位置が引き継がれず、保存済みの添付をもう一度保存することがある
 4. `1_setup.bat` を実行する
 5. `register_logon_task.bat` を実行する。登録後すぐに新しい構成でトレイが起動する
@@ -350,7 +350,7 @@ Pythonファイルをフォルダー直下に置いていた版から更新す�
 
 ## テスト
 
-GitHub ActionsのWindows / Python 3.14で、`requirements.lock` の版だけを入れて `pip check` と `tools\lock_requirements.py --check` で固定版を確かめたあと、`app\` のcompile checkと `tests\` 配下の全テストを実行する。手元ではリポジトリのルートで次を実行する。
+GitHub ActionsのWindows / Python 3.14で、`requirements.lock` の版だけを入れて `pip check` と `tools\lock_requirements.py --check` で固定版を確かめたあと、`app\`・`tools\` のcompile checkと `tests\` 配下の全テストを実行する。手元ではリポジトリのルートで次を実行する。
 
 ```text
 python -m unittest discover -s tests -t . -v

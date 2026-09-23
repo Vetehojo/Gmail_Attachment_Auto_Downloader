@@ -476,7 +476,7 @@ class InstallCommandsTest(unittest.TestCase):
                 "python -m pip check",
                 "python tools/lock_requirements.py --check",
                 "python -m pip install -r requirements.lock",
-                "python -m compileall -q app",
+                "python -m compileall -q app tools",
                 "python -m unittest discover -s tests -t . -v",
             ],
             runs,

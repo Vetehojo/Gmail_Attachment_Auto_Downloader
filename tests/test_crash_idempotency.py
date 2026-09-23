@@ -496,26 +496,30 @@ class CrashIdempotencyTest(unittest.TestCase):
                 self.assertEqual(data, handle.read())
 
     def test_prepared_journal_with_matching_file_commits_without_writing(self):
+        # A resumed job (crash between the move and the commit) takes the
+        # matching file at its pinned name as its own; only a name pinned in
+        # the same call gets a numbered copy (test_shared_folder).
         data = b"already-saved"
         service = FakeService(data)
-        with tempfile.TemporaryDirectory() as td:
-            state = os.path.join(td, "state")
-            final = os.path.join(td, "final")
-            os.makedirs(state)
-            os.makedirs(final)
-            pinned = os.path.join(final, "document.pdf")
-            with open(pinned, "wb") as handle:
-                handle.write(data)
-            marker_path = self.write_journal(state, 6, pinned, data)
-            with mock.patch.object(gmail_monitor, "STATE_DIR", state), \
-                 mock.patch.object(gmail_monitor, "_write_bytes_atomic") as write:
-                result = gmail_monitor.run_attachment_job(6, service, self.payload(final))
+        for phase, success in (("prepared", False), ("committed", True)):
+            with self.subTest(phase), tempfile.TemporaryDirectory() as td:
+                state = os.path.join(td, "state")
+                final = os.path.join(td, "final")
+                os.makedirs(state)
+                os.makedirs(final)
+                pinned = os.path.join(final, "document.pdf")
+                with open(pinned, "wb") as handle:
+                    handle.write(data)
+                marker_path = self.write_journal(state, 6, pinned, data, phase=phase, success=success)
+                with mock.patch.object(gmail_monitor, "STATE_DIR", state), \
+                     mock.patch.object(gmail_monitor, "_write_bytes_atomic") as write:
+                    result = gmail_monitor.run_attachment_job(6, service, self.payload(final))
 
-            write.assert_not_called()
-            self.assertEqual(pinned, result["target_path"])
-            self.assertEqual(["document.pdf"], os.listdir(final))
-            with open(marker_path, encoding="utf-8") as handle:
-                self.assertEqual("committed", json.load(handle)["phase"])
+                write.assert_not_called()
+                self.assertEqual(pinned, result["target_path"])
+                self.assertEqual(["document.pdf"], os.listdir(final))
+                with open(marker_path, encoding="utf-8") as handle:
+                    self.assertEqual("committed", json.load(handle)["phase"])
 
     def test_committed_or_legacy_journal_with_different_content_still_raises(self):
         data = b"job-bytes"

@@ -314,6 +314,40 @@ class NoOverwritePlacementTest(TempDirTestCase):
         self.assertIn("was taken meanwhile", self.read_log())
         self.assert_no_temp_left()
 
+    def test_same_content_saved_by_another_installation_after_pinning_gets_a_numbered_copy(self):
+        # Both installations pin the same free name for identical content and
+        # the other one saves first. Its file is not this job's result: this
+        # job saves "(1)" and each journal names its own file.
+        other_state = os.path.join(self.root, "other_state")
+        os.makedirs(other_state)
+        real = gmail_monitor._fresh_target_path
+        other = {}
+
+        def pin_then_other_installation_saves(payload, final_dir):
+            pinned = real(payload, final_dir)
+            if not other:
+                other["pinned"] = pinned
+                with mock.patch.object(gmail_monitor, "STATE_DIR", other_state):
+                    other["result"] = gmail_monitor.run_attachment_job(
+                        13, AttachmentService(self.DATA), self.payload())
+            return pinned
+
+        with mock.patch.object(gmail_monitor, "_fresh_target_path", side_effect=pin_then_other_installation_saves):
+            result = gmail_monitor.run_attachment_job(12, AttachmentService(self.DATA), self.payload())
+
+        pinned = other["pinned"]
+        stem, ext = os.path.splitext(pinned)
+        self.assertEqual(pinned, other["result"]["target_path"])
+        self.assertEqual(f"{stem}(1){ext}", result["target_path"])
+        self.assertEqual(sorted([os.path.basename(pinned), os.path.basename(result["target_path"])]),
+                         sorted(os.listdir(self.final)))
+        self.assertEqual(self.DATA, self.read(pinned))
+        self.assertEqual(self.DATA, self.read(result["target_path"]))
+        self.assertEqual({"success": True, "phase": "committed", "result": result}, self.journal(12))
+        with open(os.path.join(other_state, "attachmentjob_13.json"), encoding="utf-8") as handle:
+            self.assertEqual({"success": True, "phase": "committed", "result": other["result"]}, json.load(handle))
+        self.assert_no_temp_left()
+
     def test_the_journal_names_each_target_before_it_is_tried(self):
         pinned = self.pinned_name()
         taken = []

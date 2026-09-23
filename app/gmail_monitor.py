@@ -813,6 +813,7 @@ def run_attachment_job(job_id, service, payload, beat=None):
         if not target_path:
             raise RuntimeError("添付ファイルcommit journalが不正です。")
         prepared = marker.get("phase") == "prepared" and marker.get("success") is False
+        resumed = True
     else:
         target_path = _fresh_target_path(payload, final_dir)
         result = {
@@ -825,8 +826,12 @@ def run_attachment_job(job_id, service, payload, beat=None):
         }
         atomic_write_json(marker_path, {"success": False, "phase": "prepared", "result": result})
         prepared = True
+        resumed = False
 
-    if _file_matches(target_path, file_hash):
+    # Only a resumed job's pinned name can hold its own file (a crash between
+    # the move and the commit). A name pinned in this call was free, so a file
+    # there now is another job's or installation's, even with the same content.
+    if resumed and _file_matches(target_path, file_hash):
         atomic_write_json(marker_path, {"success": True, "phase": "committed", "result": result})
         return result
 
@@ -848,8 +853,8 @@ def run_attachment_job(job_id, service, payload, beat=None):
         atomic_write_json(marker_path, {"success": False, "phase": "prepared", "result": result})
 
     if os.path.exists(target_path):
-        # Only when _file_matches really hashed that file (a read error
-        # propagates and the job retries) is it a different file.
+        # A resumed job gets here only when _file_matches really hashed that
+        # file (a read error propagates and the job retries): a different file.
         if not os.path.isfile(target_path):
             raise RuntimeError(f"保存予定先に別内容のファイルが存在します: {target_path}")
         relocate()
