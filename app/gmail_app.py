@@ -114,8 +114,13 @@ def write_scan_start(q, start, settings):
 
 SAVED_LATER_TEXT = "設定はまだ保存していません。「保存」を押すと反映します。"
 STOP_FAILED_TEXT = (
-    "自動取得（監視プロセス）を停止できなかったため、設定を保存しませんでした。"
-    "しばらく待ってから、もう一度保存してください。"
+    "動作中の自動取得（監視プロセス）を特定できなかったか、停止できなかったため、設定を保存しませんでした。"
+    "設定は変更していません。自動取得は以前の設定のまま動いている可能性があります。"
+    "詳しい原因は log\\tray_log.txt に記録しました。"
+)
+START_FAILED_TEXT = (
+    "ただし、自動取得（監視プロセス）を開始できませんでした。"
+    "トレイアプリが定期的に開始を再試行します。「状態を表示」で状態を確認してください。"
 )
 
 
@@ -182,7 +187,7 @@ def run_connection_test(snapshot):
         "creds": login,
         "identities": {expected: actual},
     }
-    lines = [f"{note}ため、ブラウザでログインしました。"] if note else []
+    lines = [f"{note}そのため、ブラウザでログインしました。"] if note else []
     ok, _actual = verify_profile_account(profile, expected)
     if not ok:
         lines += [
@@ -202,6 +207,29 @@ def run_connection_test(snapshot):
     return {"level": "info", "title": "接続成功", "text": "\n".join(lines), "staged": staged}
 
 
+def identity_mismatches(identity_writes):
+    """(account, verified mailbox) pairs Save is about to record where the
+    mailbox is not the typed address itself: an alias, or another account."""
+    return [
+        (account, value)
+        for account, value in identity_writes.items()
+        if value and value.strip().lower() != account.strip().lower()
+    ]
+
+
+def mismatch_confirmation_text(mismatches):
+    lines = ["接続テストで確認したメールボックスが、入力したメールアドレスと異なります。"]
+    for account, mailbox in mismatches:
+        lines += ["", f"入力したメールアドレス: {account}", f"確認したメールボックス: {mailbox}"]
+    lines += [
+        "",
+        "「はい」を選ぶと、確認したメールボックスの添付を、入力したメールアドレスの保存先へ保存します。"
+        "入力したアドレスがそのメールボックスの別名（エイリアス）の場合だけ「はい」を選んでください。"
+        "「いいえ」を選ぶと保存を中止します。",
+    ]
+    return "\n".join(lines)
+
+
 def plan_identity_writes(account_ids, previous_ids, verified, stored):
     """Mailbox identities Save records, as {account: value}.
 
@@ -209,7 +237,9 @@ def plan_identity_writes(account_ids, previous_ids, verified, stored):
     adds without one gets "" - the monitor refuses it until it is tested and
     saved - unless an identity is already stored for it. Accounts configured
     before keep what they have, so an install from before identities were
-    recorded stays trust-on-first-use.
+    recorded stays trust-on-first-use. The caller passes no previous accounts
+    when the auth mode changes: a token for another mailbox must not be
+    trusted on first use.
     """
     previous = set(previous_ids)
     writes = {}
@@ -242,20 +272,33 @@ def commit_settings(plan, q):
     save_settings(plan["values"])
 
 
+def _start_monitor(controller):
+    """controller.start(); "" when it started, else what went wrong."""
+    try:
+        if controller.start():
+            return ""
+        detail = "開始の条件を満たしていないか、監視プロセスを確認できませんでした。"
+    except Exception as exc:
+        detail = str(exc)
+    log(f"Monitor start after a settings save failed: {detail}", "settings")
+    return detail
+
+
 def apply_settings_update(plan, controller, q, restart):
-    """Save's stop -> commit -> restart. Returns "" on success, else the error to show.
+    """Save's stop -> commit -> restart. Returns (saved, problem): saved is
+    True once the commit completed; problem is "" or the message to show.
 
     The settings-update marker keeps the watchdog and the tray's health tick
     from starting the monitor meanwhile. Nothing is written unless the monitor
     is confirmed stopped. A failed commit still restarts it (when `restart`)
-    and is reported.
+    and is reported; so is a restart that fails after a successful commit.
     """
     begin_settings_update(q)
     error = None
     try:
         if not controller.stop_all():
             log("Settings save aborted: the monitor could not be stopped", "settings")
-            return STOP_FAILED_TEXT
+            return False, STOP_FAILED_TEXT
         try:
             commit_settings(plan, q)
         except Exception as exc:
@@ -267,15 +310,21 @@ def apply_settings_update(plan, controller, q, restart):
         except Exception as exc:
             # It expires on its own after SETTINGS_UPDATE_SECONDS.
             log(f"Settings update marker could not be cleared: {exc}", "settings")
-    if restart:
-        controller.start()
+    start_problem = _start_monitor(controller) if restart else ""
     if error is not None:
-        resumed = "自動取得は再開しています。" if restart else ""
-        return (
+        if not restart:
+            resumed = ""
+        elif start_problem:
+            resumed = f"自動取得（監視プロセス）も開始できませんでした（{start_problem}）。"
+        else:
+            resumed = "自動取得は再開しています。"
+        return False, (
             "設定の保存中にエラーが発生しました。一部の認証情報だけが保存された可能性があります。"
             f"内容を確認して、もう一度保存してください。{resumed}\n{error}"
         )
-    return ""
+    if start_problem:
+        return True, f"{START_FAILED_TEXT}\n{start_problem}"
+    return True, ""
 
 
 class MonitorController:
@@ -317,7 +366,8 @@ class MonitorController:
                     windows_integration.taskkill_path(),
                     MONITOR_SCRIPT,
                 )
-            except windows_integration.IntegrationError:
+            except windows_integration.IntegrationError as exc:
+                log(f"Monitor stop failed: {exc}", "settings")
                 return False
         elif self.process is not None and self.process.poll() is None:
             try:
@@ -860,9 +910,13 @@ class SettingsDialog:
             scan_start = parse_scan_start(self.period.get(), self.custom_date.get())
             check_scan_start(scan_start)
         q = queue()
+        current = load_settings()
+        # After an auth mode switch the credentials that will open each mailbox
+        # are new, so no account keeps trust-on-first-use.
+        previous = get_account_configs(current) if normalize_auth_mode(current.get("auth_mode")) == mode else []
         identity_writes = plan_identity_writes(
             [account["email"] for account in accounts],
-            [account["email"] for account in get_account_configs(load_settings())],
+            [account["email"] for account in previous],
             (staged or {}).get("identities", {}),
             lambda account: q.get_metadata(identity_key(account)),
         )
@@ -884,16 +938,22 @@ class SettingsDialog:
         except Exception as exc:
             messagebox.showerror("設定内容の確認", str(exc), parent=self.win)
             return
+        mismatches = identity_mismatches(plan["identity_writes"])
+        if mismatches and not messagebox.askyesno(
+            "メールアドレスの確認", mismatch_confirmation_text(mismatches), parent=self.win
+        ):
+            return
         # setup.bat never starts automatic fetching, so --setup only stops a
         # running monitor (a registered watchdog starts it again unless paused).
         restart = not self.setup_only and not self.app.paused()
         try:
-            error = apply_settings_update(plan, self.app.controller, queue(), restart)
+            saved, problem = apply_settings_update(plan, self.app.controller, queue(), restart)
         except Exception as exc:
+            # Raised before anything was committed (e.g. the marker or the stop).
             log(f"Settings save failed: {exc}", "settings")
-            error = str(exc)
-        if error:
-            messagebox.showerror("設定を保存できませんでした", error, parent=self.win)
+            saved, problem = False, str(exc)
+        if not saved:
+            messagebox.showerror("設定を保存できませんでした", problem, parent=self.win)
             return
         text = "設定を保存しました。"
         unverified = [account for account, value in plan["identity_writes"].items() if not value]
@@ -902,7 +962,10 @@ class SettingsDialog:
                 "\n\n接続テストで確認していないアカウントがあります: " + ", ".join(unverified)
                 + "\n接続テストを実行して保存し直すまで、これらのアカウントの取得は保留します。"
             )
-        messagebox.showinfo("保存", text, parent=self.win)
+        if problem:
+            messagebox.showwarning("保存", f"{text}\n\n{problem}", parent=self.win)
+        else:
+            messagebox.showinfo("保存", text, parent=self.win)
         self.close()
 
     def _test_snapshot(self):

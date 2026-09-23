@@ -408,10 +408,27 @@ class ServicePool:
         self.auth_mode = None
         self._fingerprint = None
         self._services = {}
+        self._digest_failing = False
+
+    def _credential_digest(self, mode):
+        """credential_file_digest(mode); on a read error (e.g. the file is
+        locked while it is being replaced) the digest this pool already has for
+        the mode, i.e. "unchanged", logged once until a read succeeds again."""
+        try:
+            digest = credential_file_digest(mode)
+        except OSError as exc:
+            if not self._digest_failing:
+                log(f"Could not read the installed credential file; keeping the current Gmail services: {exc}", "auth")
+                self._digest_failing = True
+            return self._fingerprint[1] if self._fingerprint and self._fingerprint[0] == mode else None
+        if self._digest_failing:
+            log("Installed credential file is readable again", "auth")
+            self._digest_failing = False
+        return digest
 
     def _sync(self, settings):
         mode = normalize_auth_mode(settings.get("auth_mode"))
-        fingerprint = (mode, credential_file_digest(mode))
+        fingerprint = (mode, self._credential_digest(mode))
         if fingerprint != self._fingerprint:
             if self._services:
                 log(f"Authentication settings changed (mode={mode}); rebuilding Gmail services", "auth")

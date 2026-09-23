@@ -115,6 +115,20 @@ class IdentityGuardTestBase(unittest.TestCase):
     def pool(self):
         return gmail_monitor.ServicePool(self.queue)
 
+    def payload(self, account="a@example.com"):
+        return {
+            "account_email": account,
+            "final_dir": self.final_dir(account),
+            "message_id": "m1",
+            "attachment_id": "att1",
+            "part_id": "",
+            "inline": False,
+            "filename": "document.pdf",
+            "received_date": "20260825",
+            "sender_email": "sender@example.com",
+            "mail_subject": "subject",
+        }
+
 
 class ServicePoolRebuildTest(IdentityGuardTestBase):
     def test_probe_pool_after_persisted_mode_switch(self):
@@ -141,6 +155,39 @@ class ServicePoolRebuildTest(IdentityGuardTestBase):
         self.write(self.client, '{"installed": {"client_id": "other"}}')
         pool.get("a@example.com")
         self.assertEqual(2, len(self.builds))
+
+    def test_unreadable_credential_file_counts_as_unchanged(self):
+        pool = self.pool()
+        pool.get("a@example.com")
+        denied = PermissionError(13, "Access is denied", self.client)
+        logged = []
+        with mock.patch.object(gmail_monitor, "credential_file_digest", side_effect=denied), \
+             mock.patch.object(gmail_monitor, "log", lambda message, procedure="monitor": logged.append(message)):
+            pool.get("a@example.com")
+            pool.get("a@example.com")
+            self.queue.enqueue("attachment:locked", self.payload())
+            self.assertTrue(gmail_monitor.process_one_job(self.queue, pool))
+        self.assertEqual(1, len(self.builds))
+        self.assertEqual(1, sum("Could not read the installed credential file" in line for line in logged))
+        self.assertEqual("success", self.queue.get_job_by_key("attachment:locked")["status"])
+
+        with mock.patch.object(gmail_monitor, "log", lambda message, procedure="monitor": logged.append(message)):
+            pool.get("a@example.com")
+        self.assertEqual(1, len(self.builds))  # same bytes once readable again
+        self.assertIn("Installed credential file is readable again", logged)
+
+    def test_unreadable_credential_file_on_first_use_still_builds(self):
+        with mock.patch.object(gmail_monitor, "credential_file_digest", side_effect=PermissionError(13, "denied")), \
+             mock.patch.object(gmail_monitor, "log"):
+            service = self.pool().get("a@example.com")
+        self.assertEqual("a@example.com", service.mailbox)
+
+    def test_credential_file_digest_raises_other_os_errors(self):
+        os.remove(self.service_account)
+        self.assertEqual("", app_settings.credential_file_digest("dwd"))
+        with mock.patch("app_settings.open", side_effect=PermissionError(13, "denied"), create=True):
+            with self.assertRaises(PermissionError):
+                app_settings.credential_file_digest("oauth")
 
     def test_oauth_target_switch_with_the_old_token_is_refused(self):
         # config.ini now says b, but token.json still opens a's mailbox.
@@ -213,20 +260,6 @@ class GuardedScanAndJobTest(IdentityGuardTestBase):
     def metadata_keys(self):
         with contextlib.closing(sqlite3.connect(self.queue.db_path)) as conn:
             return {row[0] for row in conn.execute("SELECT key FROM metadata")}
-
-    def payload(self, account="a@example.com"):
-        return {
-            "account_email": account,
-            "final_dir": self.final_dir(account),
-            "message_id": "m1",
-            "attachment_id": "att1",
-            "part_id": "",
-            "inline": False,
-            "filename": "document.pdf",
-            "received_date": "20260825",
-            "sender_email": "sender@example.com",
-            "mail_subject": "subject",
-        }
 
     def test_scan_mismatch_leaves_the_cursor_and_queue_untouched(self):
         for mode in self.MODES:

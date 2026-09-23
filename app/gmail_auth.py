@@ -162,27 +162,32 @@ def is_installed_oauth_client(client_path):
     return _file_sha256(client_path) == _file_sha256(CREDENTIALS_FILE)
 
 
-def _refreshed_in_memory(creds):
-    """(creds, "") when usable, refreshing only in memory; else (None, reason)."""
+INSTALLED_CREDENTIALS_LABEL = "保存済みの認証情報（token.json）"
+STAGED_CREDENTIALS_LABEL = "前回のテストでログインした認証情報"
+
+
+def _refreshed_in_memory(creds, label):
+    """(creds, "") when usable, refreshing only in memory; else (None, reason).
+    A reason is one complete sentence about `label`."""
     try:
         if not creds.valid and creds.expired and creds.refresh_token:
             creds.refresh(Request())
     except Exception as exc:
-        return None, f"認証情報を更新できませんでした（{exc}）"
+        return None, f"{label}を更新できませんでした（{exc}）。"
     if not creds.valid:
-        return None, "認証情報が無効です"
+        return None, f"{label}が無効です。"
     return creds, ""
 
 
 def _installed_credentials_read_only():
     """token.json as installed, refreshed in memory only (never saved back)."""
     if not os.path.exists(TOKEN_FILE):
-        return None, "保存済みの認証情報（token.json）がありません"
+        return None, f"{INSTALLED_CREDENTIALS_LABEL}がありません。"
     try:
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
     except Exception as exc:
-        return None, f"保存済みの認証情報（token.json）を読み込めませんでした（{exc}）"
-    return _refreshed_in_memory(creds)
+        return None, f"{INSTALLED_CREDENTIALS_LABEL}を読み込めませんでした（{exc}）。"
+    return _refreshed_in_memory(creds, INSTALLED_CREDENTIALS_LABEL)
 
 
 def run_oauth_login(client_path):
@@ -198,12 +203,13 @@ def oauth_connection_test(client_path, force_login=False, staged_creds=None):
     client. Otherwise a browser login runs and its credentials are kept in
     memory. Returns (profile, login_creds, note): login_creds are what Save
     installs as token.json (None when the installed token.json was used) and
-    note says why a browser login replaced the stored credentials, if it did.
+    note is one sentence saying why a browser login replaced the stored or
+    earlier credentials, if it did.
     """
     creds = login = None
     note = ""
     if not force_login and staged_creds is not None:
-        creds, note = _refreshed_in_memory(staged_creds)
+        creds, note = _refreshed_in_memory(staged_creds, STAGED_CREDENTIALS_LABEL)
         login = creds
     if creds is None and not force_login and is_installed_oauth_client(client_path):
         creds, note = _installed_credentials_read_only()

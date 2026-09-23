@@ -83,6 +83,56 @@ class OAuthConnectionTestTest(LiveStateTestBase):
         self.assertIn("ブラウザでログインしました", result["text"])
         self.assertIsNotNone(result["staged"]["creds"])
 
+    def test_every_fallback_reason_renders_as_natural_sentences(self):
+        then = "そのため、ブラウザでログインしました。"
+        installed = "保存済みの認証情報（token.json）"
+        staged = "前回のテストでログインした認証情報"
+        cases = {
+            "no token.json": (None, None, f"{installed}がありません。{then}"),
+            "unreadable token.json": (ValueError("bad json"), None,
+                                      f"{installed}を読み込めませんでした（bad json）。{then}"),
+            "refresh failed": (FakeCreds(self.TARGET, valid=False, expired=True,
+                                         refresh_error=RuntimeError("invalid_grant")), None,
+                               f"{installed}を更新できませんでした（invalid_grant）。{then}"),
+            "invalid token": (FakeCreds(self.TARGET, valid=False, expired=False), None,
+                              f"{installed}が無効です。{then}"),
+            "earlier login expired": (None, FakeCreds("login@example.com", valid=False, expired=True,
+                                                      refresh_error=RuntimeError("expired")),
+                                      f"{staged}を更新できませんでした（expired）。{then}"),
+            "earlier login invalid": (None, FakeCreds("login@example.com", valid=False, expired=False),
+                                      f"{staged}が無効です。{then}"),
+        }
+        for name, (token, staged_creds, first_line) in cases.items():
+            with self.subTest(name):
+                self.from_client_file.reset_mock()
+                moved = False
+                if staged_creds is not None:
+                    client = self.downloaded_client()  # not the installed client
+                    load = mock.patch.object(gmail_auth.Credentials, "from_authorized_user_file")
+                elif token is None:
+                    client = self.installed_client
+                    load = mock.patch.object(gmail_auth.Credentials, "from_authorized_user_file")
+                    os.replace(self.token, self.token + ".away")
+                    moved = True
+                else:
+                    client = self.installed_client
+                    load = mock.patch.object(
+                        gmail_auth.Credentials, "from_authorized_user_file",
+                        **({"side_effect": token} if isinstance(token, Exception) else {"return_value": token}),
+                    )
+                try:
+                    with load:
+                        result = self.run_test(self.oauth_snapshot(
+                            client, email="login@example.com", staged_creds=staged_creds,
+                        ))
+                finally:
+                    if moved:
+                        os.replace(self.token + ".away", self.token)
+                self.from_client_file.assert_called_once()
+                self.assertEqual(first_line, result["text"].splitlines()[0])
+                self.assertNotIn("ませんため", result["text"])
+                self.assertNotIn("ですため", result["text"])
+
     def test_a_staged_login_is_reused_without_another_browser_login(self):
         self.live_token()
         staged = FakeCreds("login@example.com")

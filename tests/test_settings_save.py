@@ -13,10 +13,11 @@ from unittest import mock
 import app_settings
 import gmail_app
 import gmail_auth
+import gmail_monitor
 import runtime_state
 import watchdog
 from job_queue import JobQueue
-from tests.settings_support import FakeButton, FakeCreds, FakeWin, LiveStateTestBase, Root, Var
+from tests.settings_support import FakeButton, FakeCreds, FakeWin, LiveStateTestBase, ProfileService, Root, Var
 
 
 class SaveTestBase(LiveStateTestBase):
@@ -26,7 +27,8 @@ class SaveTestBase(LiveStateTestBase):
         self.queue = JobQueue(self.queue_db)
         self.controller = mock.Mock()
         self.controller.stop_all.side_effect = self._stop_all
-        self.controller.start.side_effect = lambda: self.events.append("start")
+        self.controller.start.side_effect = self._start
+        self.start_result = True
         self.stop_result = True
         self.paused = False
         real_copy_credentials = app_settings.copy_credentials
@@ -51,6 +53,12 @@ class SaveTestBase(LiveStateTestBase):
         for patcher in patches:
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def _start(self):
+        self.events.append("start")
+        if isinstance(self.start_result, Exception):
+            raise self.start_result
+        return self.start_result
 
     def _stop_all(self):
         self.events.append(("stop_all", runtime_state.settings_update_in_progress(self.queue)))
@@ -158,6 +166,8 @@ class SaveOrderTest(SaveTestBase):
             self.assertIn(email, handle.read())
         self.assertTrue(dialog._closed)
         self.assertIsNone(dialog._staged)
+        gmail_app.messagebox.askyesno.assert_not_called()
+        gmail_app.messagebox.showwarning.assert_not_called()
 
     def test_save_without_a_login_keeps_the_live_token(self):
         dialog = self.make_dialog(final=self.final)
@@ -168,6 +178,73 @@ class SaveOrderTest(SaveTestBase):
         with open(self.token, encoding="utf-8") as handle:
             self.assertEqual('{"token": "live"}', handle.read())
         self.assertEqual("start", self.events[-1])
+        # Same auth mode, account configured before: stays trust-on-first-use.
+        self.assertEqual({}, self.identities())
+
+    def test_auth_mode_switch_trusts_no_account_on_first_use(self):
+        # A legacy DWD install (no stored identity) switched to OAuth without a
+        # test: the old token.json may open another mailbox, so the account
+        # must be refused until it is tested and saved.
+        app_settings.save_settings({
+            "auth_mode": "dwd",
+            "dwd_accounts": app_settings.encode_dwd_accounts([{"email": self.TARGET, "final_dir": self.final}]),
+        })
+        dialog = self.make_dialog(final=self.final)
+
+        dialog.save()
+
+        self.assertEqual({self.TARGET: ""}, self.identities())
+        self.assertIn(f"接続テストで確認していないアカウントがあります: {self.TARGET}",
+                      gmail_app.messagebox.showinfo.call_args.args[1])
+        with mock.patch.object(gmail_monitor, "log"):
+            with self.assertRaises(gmail_monitor.AuthenticationRequiredError):
+                gmail_monitor.verify_mailbox_identity(self.queue, self.TARGET, ProfileService("other@example.com"))
+
+    def test_alias_mismatch_is_confirmed_before_anything_is_stopped(self):
+        client = self.downloaded_client()
+        staged = self.staged_login(client, "info@example.com", "owner@example.com")
+        gmail_app.messagebox.askyesno.return_value = False
+        dialog = self.make_dialog(credentials=client, email="info@example.com", staged=staged)
+        before = self.snapshot()
+
+        dialog.save()
+
+        text = gmail_app.messagebox.askyesno.call_args.args[1]
+        self.assertIn("info@example.com", text)
+        self.assertIn("owner@example.com", text)
+        self.controller.stop_all.assert_not_called()
+        self.assertEqual([], self.events)
+        self.assertEqual(before, self.snapshot())
+        self.assertFalse(dialog._closed)
+        self.assertIs(staged, dialog._staged)
+
+        gmail_app.messagebox.askyesno.return_value = True
+        dialog.save()
+
+        self.assertEqual({"info@example.com": "owner@example.com"}, self.identities())
+        self.assertEqual("start", self.events[-1])
+        self.assertTrue(dialog._closed)
+
+    def test_failed_restart_after_a_commit_is_reported_as_saved(self):
+        for failure in (False, OSError("spawn failed")):
+            with self.subTest(failure=failure):
+                self.events.clear()
+                gmail_app.messagebox.reset_mock()
+                self.start_result = failure
+                dialog = self.make_dialog(final=self.new_final)
+
+                dialog.save()
+
+                self.assertEqual("save_settings", self.events[-2])
+                self.assertEqual("start", self.events[-1])
+                gmail_app.messagebox.showerror.assert_not_called()
+                text = gmail_app.messagebox.showwarning.call_args.args[1]
+                self.assertTrue(text.startswith("設定を保存しました。"))
+                self.assertIn(gmail_app.START_FAILED_TEXT, text)
+                if isinstance(failure, Exception):
+                    self.assertIn("spawn failed", text)
+                self.assertTrue(dialog._closed)
+                self.assertEqual(os.path.abspath(self.new_final), app_settings.load_settings()["final_dir"])
 
     def test_stale_stage_is_not_committed(self):
         client = self.downloaded_client()
@@ -199,8 +276,20 @@ class SaveOrderTest(SaveTestBase):
             {k: v for k, v in self.snapshot().items() if not k.startswith(("state", "log"))},
         )
         self.assertEqual(gmail_app.STOP_FAILED_TEXT, gmail_app.messagebox.showerror.call_args.args[1])
+        self.assertIn("特定できなかったか、停止できなかった", gmail_app.STOP_FAILED_TEXT)
+        self.assertNotIn("しばらく待って", gmail_app.STOP_FAILED_TEXT)
         self.assertFalse(dialog._closed)
         self.assertIsNotNone(dialog._staged)
+
+    def test_monitor_stop_failure_cause_is_logged(self):
+        integration = gmail_app.windows_integration
+        with mock.patch.object(gmail_app.os, "name", "nt"), \
+             mock.patch.object(integration, "Runner"), \
+             mock.patch.object(integration, "stop_owned_monitors",
+                               side_effect=integration.IntegrationError("identity changed")):
+            self.assertFalse(gmail_app.MonitorController().stop_all())
+        with open(os.path.join(self.root, "log", "tray_log.txt"), encoding="utf-8") as handle:
+            self.assertIn("Monitor stop failed: identity changed", handle.read())
 
     def test_commit_failure_restarts_and_reports(self):
         dialog = self.make_dialog(final=self.final)
@@ -214,6 +303,17 @@ class SaveOrderTest(SaveTestBase):
         self.assertIn("自動取得は再開しています", message)
         self.assertFalse(dialog._closed)
         self.assertEqual(self.TARGET, app_settings.load_settings()["target_email"])
+
+    def test_commit_and_restart_failures_are_both_reported(self):
+        self.start_result = False
+        dialog = self.make_dialog(final=self.final)
+        with mock.patch.object(gmail_app, "copy_credentials", side_effect=OSError("disk gone")):
+            dialog.save()
+
+        message = gmail_app.messagebox.showerror.call_args.args[1]
+        self.assertIn("disk gone", message)
+        self.assertIn("自動取得（監視プロセス）も開始できませんでした", message)
+        self.assertNotIn("自動取得は再開しています", message)
 
     def test_paused_save_stops_and_commits_without_restarting(self):
         self.paused = True
@@ -289,6 +389,21 @@ class SaveOrderTest(SaveTestBase):
     def metadata(self):
         with contextlib.closing(sqlite3.connect(self.queue_db)) as conn:
             return conn.execute("SELECT key, value, updated_at FROM metadata ORDER BY key").fetchall()
+
+
+class IdentityMismatchTest(unittest.TestCase):
+    def test_only_a_different_mailbox_is_a_mismatch(self):
+        writes = {
+            "info@example.com": "owner@example.com",
+            "same@example.com": "Same@Example.com",
+            "untested@example.com": "",
+        }
+        mismatches = gmail_app.identity_mismatches(writes)
+        self.assertEqual([("info@example.com", "owner@example.com")], mismatches)
+        text = gmail_app.mismatch_confirmation_text(mismatches)
+        self.assertIn("入力したメールアドレス: info@example.com", text)
+        self.assertIn("確認したメールボックス: owner@example.com", text)
+        self.assertIn("「いいえ」を選ぶと保存を中止します。", text)
 
 
 class PlanIdentityWritesTest(unittest.TestCase):
