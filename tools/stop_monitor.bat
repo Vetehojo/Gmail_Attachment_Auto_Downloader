@@ -7,8 +7,8 @@ echo Gmail Monitor - Stop Process Tree
 echo ========================================
 echo.
 
-set "MONITOR_PY=%~dp0gmail_monitor.py"
-set "INTEGRATION_PY=%~dp0windows_integration.py"
+set "MONITOR_PY=%~dp0..\app\gmail_monitor.py"
+set "INTEGRATION_PY=%~dp0..\app\windows_integration.py"
 if not exist "%MONITOR_PY%" goto :END_ERROR
 if not exist "%INTEGRATION_PY%" goto :END_ERROR
 

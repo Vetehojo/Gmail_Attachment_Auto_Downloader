@@ -90,14 +90,10 @@ MIT License（[LICENSE](LICENSE)）。依存パッケージのライセンスは
 
 ## 開発
 
-```
-tests\run_virtual_download_test.bat
-```
-
-または直接:
+アプリ本体の Python ファイルは `app\`、切り分け用のバッチは `tools\` にある。テストはリポジトリのルートで実行する。
 
 ```
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -t . -v
 ```
 
 Gmail API へは接続せず、ページネーション・カーソル・重複排除・クラッシュ復旧・保持期間などを検証する。

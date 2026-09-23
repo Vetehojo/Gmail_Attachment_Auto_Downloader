@@ -6,9 +6,11 @@ import shutil
 import subprocess
 from datetime import datetime, timedelta
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(_SCRIPT_DIR, "config.ini")
-STATE_DIR = os.path.join(_SCRIPT_DIR, "state")
+# Install folder = parent of app/. config.ini, state/ and log/ live here, and
+# every module derives its data paths from this one value.
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
+STATE_DIR = os.path.join(BASE_DIR, "state")
 APP_DATA_DIR = (
     os.path.join(os.environ.get("LOCALAPPDATA", STATE_DIR), "GmailAutoDownloader")
     if os.name == "nt"

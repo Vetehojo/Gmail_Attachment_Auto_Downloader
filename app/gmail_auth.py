@@ -10,6 +10,7 @@ from googleapiclient.discovery import build
 from app_settings import (
     AUTH_DWD,
     AUTH_OAUTH,
+    BASE_DIR,
     CREDENTIALS_PATH,
     SERVICE_ACCOUNT_PATH,
     TOKEN_PATH,
@@ -21,11 +22,10 @@ from app_settings import (
 )
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CREDENTIALS_FILE = CREDENTIALS_PATH
 SERVICE_ACCOUNT_FILE = SERVICE_ACCOUNT_PATH
 TOKEN_FILE = TOKEN_PATH
-LEGACY_TOKEN_FILE = os.path.join(_SCRIPT_DIR, "token.pickle")
+LEGACY_TOKEN_FILE = os.path.join(BASE_DIR, "token.pickle")
 
 
 class AuthenticationRequiredError(RuntimeError):

@@ -16,9 +16,9 @@ import windows_integration
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_DIR = os.path.join(SCRIPT_DIR, "state")
+STATE_DIR = os.path.join(app_settings.BASE_DIR, "state")
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
-WATCHDOG_LOG = os.path.join(SCRIPT_DIR, "log", "watchdog_log.txt")
+WATCHDOG_LOG = os.path.join(app_settings.BASE_DIR, "log", "watchdog_log.txt")
 STATE_FILE = os.path.join(STATE_DIR, "watchdog_state.json")
 QUEUE_DB = os.path.join(STATE_DIR, "jobs.sqlite3")
 MONITOR_SCRIPT = os.path.join(SCRIPT_DIR, "gmail_monitor.py")
@@ -167,7 +167,7 @@ def start_monitor():
             return False
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(
-        [sys.executable, MONITOR_SCRIPT], cwd=SCRIPT_DIR,
+        [sys.executable, MONITOR_SCRIPT], cwd=app_settings.BASE_DIR,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=creationflags,
     )

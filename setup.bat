@@ -4,6 +4,7 @@ chcp 65001 >nul
 
 set "SDIR=%~dp0"
 if "%SDIR:~-1%"=="\" set "SDIR=%SDIR:~0,-1%"
+set "APP_PY=%~dp0app\gmail_app.py"
 
 echo.
 echo ============================================
@@ -37,7 +38,7 @@ if not "%PIP_RESULT%"=="0" goto :END_ERROR
 
 echo [3/3] Opening setup window...
 pushd "%SDIR%"
-python gmail_app.py --setup
+python "%APP_PY%" --setup
 set "GUI_RESULT=%ERRORLEVEL%"
 popd
 if not "%GUI_RESULT%"=="0" goto :END_ERROR
@@ -48,7 +49,7 @@ if not exist "%SDIR%\config.ini" (
     goto :END_OK
 )
 
-start "" "%PYTHONW%" "%SDIR%\gmail_app.py"
+start "" "%PYTHONW%" "%APP_PY%"
 
 echo.
 echo Setup complete. Tray app started.

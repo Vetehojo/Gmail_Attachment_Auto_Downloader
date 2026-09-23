@@ -12,6 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 from app_settings import (
     AUTH_DWD,
     AUTH_OAUTH,
+    BASE_DIR,
     CREDENTIALS_PATH,
     SERVICE_ACCOUNT_PATH,
     STATE_DIR,
@@ -36,7 +37,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 QUEUE_DB = os.path.join(STATE_DIR, "jobs.sqlite3")
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
 APP_LOCK_FILE = os.path.join(STATE_DIR, "app.lock")
-TRAY_LOG = os.path.join(SCRIPT_DIR, "log", "tray_log.txt")
+TRAY_LOG = os.path.join(BASE_DIR, "log", "tray_log.txt")
 MONITOR_SCRIPT = os.path.join(SCRIPT_DIR, "gmail_monitor.py")
 MAIL_CURSOR_KEY = "mail_cursor_timestamp"
 PAUSED_KEY = "monitor_paused"
@@ -103,7 +104,7 @@ class MonitorController:
             return False
         self.process = subprocess.Popen(
             [sys.executable, MONITOR_SCRIPT],
-            cwd=SCRIPT_DIR,
+            cwd=BASE_DIR,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -256,7 +257,7 @@ class DwdAccountEditor:
         center_on_parent(self.win, parent)
 
     def _browse(self):
-        path = filedialog.askdirectory(parent=self.win, initialdir=self.folder.get() or SCRIPT_DIR)
+        path = filedialog.askdirectory(parent=self.win, initialdir=self.folder.get() or BASE_DIR)
         if path:
             self.folder.set(path)
 
@@ -492,7 +493,7 @@ class SettingsDialog:
             self.oauth_frame.grid()
 
     def _pick_dir(self, variable):
-        path = filedialog.askdirectory(parent=self.win, initialdir=variable.get() or SCRIPT_DIR)
+        path = filedialog.askdirectory(parent=self.win, initialdir=variable.get() or BASE_DIR)
         if path:
             variable.set(path)
 

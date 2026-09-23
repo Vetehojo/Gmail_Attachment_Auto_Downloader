@@ -149,7 +149,7 @@ OAuth token失効やDWD認証障害は通常のダウンロード失敗とは分
 
 ## タスクトレイ
 
-`register_logon_task.bat` はログオン時に `pythonw.exe gmail_app.py` を起動する。VBSラッパーは使用しない。
+`register_logon_task.bat` はログオン時に `pythonw.exe app\gmail_app.py` を起動する。VBSラッパーは使用しない。
 
 トレイメニュー:
 
@@ -198,16 +198,30 @@ worker
 | --- | --- |
 | `setup.bat` | 依存導入 + 設定GUI |
 | `register_logon_task.bat` | ログオン時起動 + watchdogのタスク登録 |
-| `start_monitor.bat` | monitorを前面で起動（切り分け用） |
-| `stop_monitor.bat` | monitorプロセスツリーを停止 |
-| `start_test.bat` | Gmail API接続と直近メール検索だけ確認 |
-| `test_latest_attachment_download.bat` | 本番と同じ経路で1サイクル実行 |
-| `tests\run_virtual_download_test.bat` | ユニットテスト一式 |
-| `reset_last_check.bat` | メールカーソルを戻して再スキャン |
+| `tools\start_monitor.bat` | monitorを前面で起動（切り分け用） |
+| `tools\stop_monitor.bat` | monitorプロセスツリーを停止 |
+
+アプリ本体のPythonファイルは `app\` にある。`config.ini`・`state\`・`log\` はフォルダー直下に置く。過去のメールを確認し直すときは、トレイメニューの「期間を指定して再確認」を使う。
+
+## 旧フォルダー構成からの更新
+
+Pythonファイルをフォルダー直下に置いていた版から更新した場合、登録済みのタスクは旧パスのスクリプトを指したままになる。`register_logon_task.bat` は自分の登録と一致しないタスクを書き換えずに停止するので、次の順で入れ替える。
+
+1. トレイメニューの「終了（自動取得を停止）」でトレイアプリを終了する。旧トレイが動いたままだと、新しいトレイは多重起動防止により何もせず終了する
+2. タスクスケジューラで `Gmail Auto Downloader Monitor` と `Gmail Auto Downloader Watchdog` を削除する
+3. `register_logon_task.bat` を実行する。次回ログオンから新しい構成でトレイが起動する
+
+`config.ini`・`state\`・`log\` の場所は変わらないため、設定と処理キューはそのまま引き継がれる。
 
 ## テスト
 
-GitHub ActionsのWindows / Python 3.14で、runtime moduleのcompile checkと `tests/` 配下の全テスト(`python -m unittest discover -s tests -v`)を実行し、主に次を確認する。
+GitHub ActionsのWindows / Python 3.14で、`app\` のcompile checkと `tests\` 配下の全テストを実行する。手元ではリポジトリのルートで次を実行する。
+
+```text
+python -m unittest discover -s tests -t . -v
+```
+
+主に次を確認する。
 
 - runtime module compile
 - Gmail pagination

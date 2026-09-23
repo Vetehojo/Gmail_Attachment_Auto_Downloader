@@ -21,6 +21,7 @@ from googleapiclient.errors import HttpError
 
 from app_settings import (
     AUTH_DWD,
+    BASE_DIR,
     get_account_configs,
     load_allowed_extensions,
     load_excluded_labels,
@@ -32,12 +33,11 @@ from gmail_auth import AuthenticationRequiredError, get_gmail_service
 from job_queue import JobQueue
 from runtime_state import SingleInstance, append_log, atomic_write_json, write_heartbeat
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_DIR = os.path.join(_SCRIPT_DIR, "state")
+STATE_DIR = os.path.join(BASE_DIR, "state")
 QUEUE_DB = os.path.join(STATE_DIR, "jobs.sqlite3")
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
 LOCK_FILE = os.path.join(STATE_DIR, "monitor.lock")
-LOG_FILE = os.path.join(_SCRIPT_DIR, "log", "mail_log.txt")
+LOG_FILE = os.path.join(BASE_DIR, "log", "mail_log.txt")
 MAIL_CURSOR_KEY = "mail_cursor_timestamp"
 RETENTION_KEY = "jobs_retention_last_run"
 LAST_ERROR_KEY = "monitor_last_error"

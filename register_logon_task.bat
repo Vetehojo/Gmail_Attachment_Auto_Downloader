@@ -2,9 +2,9 @@
 setlocal
 chcp 65001 >nul
 
-set "APP_PY=%~dp0gmail_app.py"
-set "WATCHDOG_PY=%~dp0watchdog.py"
-set "INTEGRATION_PY=%~dp0windows_integration.py"
+set "APP_PY=%~dp0app\gmail_app.py"
+set "WATCHDOG_PY=%~dp0app\watchdog.py"
+set "INTEGRATION_PY=%~dp0app\windows_integration.py"
 set "TASK_USER=%USERDOMAIN%\%USERNAME%"
 
 for /f "usebackq delims=" %%p in (`python -X utf8 -c "import os,sys; print(os.path.join(os.path.dirname(sys.executable),'pythonw.exe'))"`) do set "PYTHONW=%%p"
@@ -47,5 +47,8 @@ echo.
 echo [ERROR] Failed to register scheduled tasks.
 echo Existing tasks were left untouched unless their executable and script matched this install.
 echo Any partial update was rolled back and verified where possible.
+echo When upgrading from the old layout, exit the tray app and delete the old
+echo "Gmail Auto Downloader Monitor" and "Gmail Auto Downloader Watchdog" tasks
+echo in Task Scheduler first, then run this file again.
 pause
 exit /b 1

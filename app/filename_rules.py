@@ -2,8 +2,9 @@ import configparser
 import os
 import re
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "config.ini")
+from app_settings import BASE_DIR
+
+_CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 DEFAULT_TEMPLATE = "{original}_{date}_{subject}_{sender}"
 DEFAULT_SUBJECT_MAX = 50
 _ALLOWED_FIELDS = {"original", "date", "subject", "sender"}
