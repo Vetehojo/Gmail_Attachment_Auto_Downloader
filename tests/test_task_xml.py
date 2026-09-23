@@ -354,6 +354,72 @@ class LookupAccountSidTest(unittest.TestCase):
         with self.assertRaises(win.IntegrationError):
             win.lookup_account_sid(f"{os.environ['COMPUTERNAME']}\\gad-no-such-user-7f3c9e")
 
+    def test_machine_domain_name_is_not_a_user_account(self):
+        # The computer name resolves to the local account domain (SidTypeDomain).
+        with self.assertRaisesRegex(win.IntegrationError, "not a user account"):
+            win.lookup_account_sid(os.environ["COMPUTERNAME"])
+
+
+class FakeApi:
+    def __init__(self, impl):
+        self.impl = impl
+
+    def __call__(self, *args):
+        return self.impl(*args)
+
+
+def fake_windll(sid_type, calls):
+    """advapi32/kernel32 stand-ins: LookupAccountNameW reports `sid_type`."""
+
+    def lookup(system, account, sid, sid_size, domain, domain_size, use):
+        calls.append(("lookup", account))
+        sid_size._obj.value = 16
+        domain_size._obj.value = 3
+        use._obj.value = sid_type
+        return 0 if sid is None else 1
+
+    def convert(sid, string_sid):
+        calls.append(("convert",))
+        string_sid._obj.value = SID
+        return 1
+
+    def factory(name, use_last_error=False):
+        return mock.Mock(
+            LookupAccountNameW=FakeApi(lookup),
+            ConvertSidToStringSidW=FakeApi(convert),
+            LocalFree=FakeApi(lambda pointer: None),
+        )
+
+    return factory
+
+
+@unittest.skipUnless(os.name == "nt", "Windows account lookup")
+class LookupAccountSidTypeTest(unittest.TestCase):
+    def test_user_account_resolves(self):
+        calls = []
+        with mock.patch("ctypes.WinDLL", side_effect=fake_windll(1, calls)):
+            self.assertEqual(SID, win.lookup_account_sid(USER))
+        self.assertEqual([("lookup", USER), ("lookup", USER), ("convert",)], calls)
+
+    def test_non_user_sid_types_are_rejected(self):
+        # Group, Domain, Alias, WellKnownGroup, DeletedAccount, Invalid, Unknown, Computer, Label.
+        for sid_type in (2, 3, 4, 5, 6, 7, 8, 9, 10):
+            with self.subTest(sid_type=sid_type):
+                calls = []
+                with mock.patch("ctypes.WinDLL", side_effect=fake_windll(sid_type, calls)):
+                    with self.assertRaisesRegex(win.IntegrationError, f"not a user account \\(SID type {sid_type}\\)"):
+                        win.lookup_account_sid(r"PC\Administrators")
+                self.assertNotIn(("convert",), calls)
+
+    def test_group_account_blocks_registration_before_any_task_scheduler_call(self):
+        runner = mock.Mock(spec=win.Runner)
+        with mock.patch("ctypes.WinDLL", side_effect=fake_windll(4, [])):
+            with self.assertRaisesRegex(win.IntegrationError, "not a user account"):
+                win.register_tasks_transaction(
+                    runner, "schtasks.exe", [spec(win.LOGON_TRIGGER, user=r"PC\Administrators")], clock=lambda: NOW
+                )
+        runner.run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

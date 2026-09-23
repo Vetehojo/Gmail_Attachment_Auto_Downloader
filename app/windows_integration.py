@@ -30,6 +30,7 @@ EXECUTION_TIME_LIMITS = {LOGON_TRIGGER: "PT0S", INTERVAL_TRIGGER: "PT10M"}
 TASK_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 _UTF16_BOM = b"\xff\xfe"
 _SID_PATTERN = re.compile(r"^S-1-\d+(-\d+)+$", re.IGNORECASE)
+_SID_TYPE_USER = 1  # SID_NAME_USE.SidTypeUser
 _XML_DECLARATION = re.compile(r"^\s*<\?xml[^>]*\?>\s*")
 # XML 1.0 forbids C0 controls and U+FFFE/U+FFFF; task fields never contain them.
 _FORBIDDEN_XML_CHARS = re.compile("[\x00-\x1f" + chr(0xFFFE) + chr(0xFFFF) + "]")
@@ -156,21 +157,26 @@ def parse_task_action(xml_bytes: bytes) -> tuple[str, str]:
         root = ET.fromstring(decode_windows_output(xml_bytes))
     except (ET.ParseError, UnicodeError) as exc:
         raise IntegrationError("Task Scheduler XML is invalid") from exc
-    actions = []
-    for element in root.iter():
-        if _local_name(element.tag) != "Exec":
-            continue
-        command = ""
-        arguments = ""
-        for child in element:
-            if _local_name(child.tag) == "Command":
-                command = child.text or ""
-            elif _local_name(child.tag) == "Arguments":
-                arguments = child.text or ""
-        actions.append((command.strip(), arguments.strip()))
-    if len(actions) != 1 or not actions[0][0]:
+    # Every action of every Actions block counts: an extra ComHandler, e-mail
+    # or message action makes the task something other than this app's task.
+    actions = [
+        action
+        for block in root
+        if _local_name(block.tag) == "Actions"
+        for action in block
+    ]
+    if len(actions) != 1 or _local_name(actions[0].tag) != "Exec":
         raise IntegrationError("Task must contain exactly one executable action")
-    return actions[0]
+    command = ""
+    arguments = ""
+    for child in actions[0]:
+        if _local_name(child.tag) == "Command":
+            command = child.text or ""
+        elif _local_name(child.tag) == "Arguments":
+            arguments = child.text or ""
+    if not command.strip():
+        raise IntegrationError("Task must contain exactly one executable action")
+    return command.strip(), arguments.strip()
 
 
 def action_is_owned(xml_bytes: bytes, executable: str, script: str) -> bool:
@@ -191,8 +197,17 @@ def _task_name(name: str) -> str:
     return "\\" + name.lstrip("\\")
 
 
+def _run_tool(runner: Runner, command: list[str]) -> CommandResult:
+    # A tool that cannot be started is an IntegrationError, so callers classify
+    # it as unknown and the registration transaction still rolls back.
+    try:
+        return runner.run(command)
+    except OSError as exc:
+        raise IntegrationError(f"{os.path.basename(command[0])} could not be run: {exc}") from exc
+
+
 def query_task_xml(runner: Runner, schtasks: str, name: str) -> bytes:
-    result = runner.run([schtasks, "/Query", "/TN", name, "/XML"])
+    result = _run_tool(runner, [schtasks, "/Query", "/TN", name, "/XML"])
     if result.returncode != 0 or not result.stdout:
         raise IntegrationError("Task XML query failed")
     parse_task_action(result.stdout)
@@ -202,7 +217,10 @@ def query_task_xml(runner: Runner, schtasks: str, name: str) -> bytes:
 def classify_task(
     runner: Runner, schtasks: str, name: str, executable: str, script: str
 ) -> tuple[str, bytes | None]:
-    listing = runner.run([schtasks, "/Query", "/FO", "CSV", "/NH"])
+    try:
+        listing = _run_tool(runner, [schtasks, "/Query", "/FO", "CSV", "/NH"])
+    except IntegrationError:
+        return UNKNOWN, None
     if listing.returncode != 0:
         return UNKNOWN, None
     try:
@@ -347,11 +365,17 @@ def _utf16_task_document(xml_bytes: bytes) -> bytes:
 def _run_create_xml(runner: Runner, schtasks: str, name: str, document: bytes) -> CommandResult:
     # The document is fully built before the private temp file exists, and the
     # file is closed before schtasks reads it and removed afterwards.
-    handle, path = tempfile.mkstemp(prefix="gmail-task-", suffix=".xml")
     try:
-        with os.fdopen(handle, "wb") as output:
-            output.write(document)
-        return runner.run([schtasks, "/Create", "/F", "/TN", name, "/XML", path])
+        handle, path = tempfile.mkstemp(prefix="gmail-task-", suffix=".xml")
+    except OSError as exc:
+        raise IntegrationError(f"Temporary task XML could not be created: {exc}") from exc
+    try:
+        try:
+            with os.fdopen(handle, "wb") as output:
+                output.write(document)
+        except OSError as exc:
+            raise IntegrationError(f"Temporary task XML could not be written: {exc}") from exc
+        return _run_tool(runner, [schtasks, "/Create", "/F", "/TN", name, "/XML", path])
     finally:
         try:
             os.remove(path)
@@ -403,6 +427,8 @@ def lookup_account_sid(account: str) -> str:
         raise IntegrationError(
             f"Windows account could not be resolved (error {ctypes.get_last_error()})"
         )
+    if use.value != _SID_TYPE_USER:
+        raise IntegrationError(f"Windows account is not a user account (SID type {use.value})")
     string_sid = wintypes.LPWSTR()
     if not convert(sid, ctypes.byref(string_sid)):
         raise IntegrationError(
@@ -519,7 +545,10 @@ def _create_task(
         runner, schtasks, str(spec["name"]), str(spec["executable"]), str(spec["script"])
     )
     if state != OWNED or installed_xml is None:
-        raise IntegrationError("Created task identity could not be verified")
+        raise IntegrationError(
+            f"Created task '{spec['name']}' could not be verified as this install's task "
+            "(install paths with characters outside the Windows code page cannot be registered)"
+        )
     return installed_xml
 
 
@@ -539,7 +568,7 @@ def _restore_task(
     if _xml_signature(_current) != _xml_signature(installed_xml):
         raise IntegrationError("Rollback refused to overwrite task definition drift")
     if original_state == ABSENT:
-        deleted = runner.run([schtasks, "/Delete", "/F", "/TN", str(spec["name"])])
+        deleted = _run_tool(runner, [schtasks, "/Delete", "/F", "/TN", str(spec["name"])])
         if deleted.returncode != 0:
             raise IntegrationError("Rollback could not delete the newly-created task")
         state, _ = classify_task(

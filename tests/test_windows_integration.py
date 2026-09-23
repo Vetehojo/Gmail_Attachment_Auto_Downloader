@@ -59,6 +59,21 @@ def task_xml(executable, script, description="日本語 & safe"):
     return b"\xff\xfe" + xml.encode("utf-16-le")
 
 
+EXEC_ACTION = r'<Exec><Command>C:\Python\pythonw.exe</Command><Arguments>"C:\App\gmail_app.py"</Arguments></Exec>'
+COM_ACTION = "<ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId></ComHandler>"
+MESSAGE_ACTION = "<ShowMessage><Title>t</Title><Body>b</Body></ShowMessage>"
+EMAIL_ACTION = "<SendEmail><Server>smtp.invalid</Server><To>a@b.invalid</To><From>c@d.invalid</From></SendEmail>"
+
+
+def task_xml_with_actions(*blocks):
+    actions = "".join(f'<Actions Context="Author">{block}</Actions>' for block in blocks)
+    xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  {actions}
+</Task>"""
+    return b"\xff\xfe" + xml.encode("utf-16-le")
+
+
 def task_listing(names):
     output = io.StringIO()
     writer = csv.writer(output, lineterminator="\r\n")
@@ -262,6 +277,37 @@ class DecodeAndTaskParsingTest(unittest.TestCase):
         )
         self.assertFalse(win.action_is_owned(data, executable, script))
 
+    def test_only_a_single_exec_action_can_be_owned(self):
+        executable = r"C:\Python\pythonw.exe"
+        script = r"C:\App\gmail_app.py"
+        self.assertTrue(win.action_is_owned(task_xml_with_actions(EXEC_ACTION), executable, script))
+        for blocks in (
+            (EXEC_ACTION + COM_ACTION,),
+            (COM_ACTION + EXEC_ACTION,),
+            (EXEC_ACTION + MESSAGE_ACTION,),
+            (EXEC_ACTION + EMAIL_ACTION,),
+            (EXEC_ACTION + EXEC_ACTION,),
+            (COM_ACTION,),
+            (EXEC_ACTION, EXEC_ACTION),
+            (EXEC_ACTION, COM_ACTION),
+            (),
+        ):
+            with self.subTest(blocks=blocks):
+                data = task_xml_with_actions(*blocks)
+                with self.assertRaisesRegex(win.IntegrationError, "exactly one executable action"):
+                    win.parse_task_action(data)
+                runner = StatefulTaskRunner({"App Task": data})
+                self.assertEqual(
+                    (win.UNKNOWN, None), win.classify_task(runner, "schtasks.exe", "App Task", executable, script)
+                )
+
+    def test_exec_outside_the_actions_block_is_not_counted(self):
+        data = task_xml_with_actions(COM_ACTION).replace(
+            "</Task>".encode("utf-16-le"), f"<Data>{EXEC_ACTION}</Data></Task>".encode("utf-16-le")
+        )
+        with self.assertRaisesRegex(win.IntegrationError, "exactly one executable action"):
+            win.parse_task_action(data)
+
 
 class TaskTransactionTest(unittest.TestCase):
     def specs(self):
@@ -398,10 +444,191 @@ class TaskTransactionTest(unittest.TestCase):
                     seen.append((path, source.read()))
                 raise OSError("spawn failed")
 
-        with self.assertRaises(OSError):
+        with self.assertRaisesRegex(win.IntegrationError, "^schtasks.exe could not be run: spawn failed$") as caught:
             win._run_create_xml(ExplodingRunner(), "schtasks.exe", "App Task", b"\xff\xfedata")
+        self.assertIsInstance(caught.exception.__cause__, OSError)
         self.assertEqual(b"\xff\xfedata", seen[0][1])
         self.assertFalse(os.path.exists(seen[0][0]))
+
+    def test_temp_xml_creation_failure_is_an_integration_error(self):
+        runner = StatefulTaskRunner()
+        with mock.patch.object(win.tempfile, "mkstemp", side_effect=OSError(28, "No space left")):
+            with self.assertRaisesRegex(win.IntegrationError, "Temporary task XML could not be created") as caught:
+                win._run_create_xml(runner, "schtasks.exe", "App Task", b"\xff\xfedata")
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertEqual([], runner.commands)
+
+    def test_temp_xml_write_failure_is_an_integration_error_and_removes_the_file(self):
+        runner = StatefulTaskRunner()
+        created = []
+        real_mkstemp = win.tempfile.mkstemp
+        real_fdopen = win.os.fdopen
+
+        def recording_mkstemp(*args, **kwargs):
+            handle, path = real_mkstemp(*args, **kwargs)
+            created.append(path)
+            return handle, path
+
+        class FullDisk:
+            def __init__(self, handle):
+                self.file = real_fdopen(handle, "wb")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                self.file.close()
+
+            def write(self, data):
+                raise OSError(28, "No space left")
+
+        with mock.patch.object(win.tempfile, "mkstemp", side_effect=recording_mkstemp), \
+             mock.patch.object(win.os, "fdopen", side_effect=lambda handle, mode: FullDisk(handle)):
+            with self.assertRaisesRegex(win.IntegrationError, "Temporary task XML could not be written"):
+                win._run_create_xml(runner, "schtasks.exe", "App Task", b"\xff\xfedata")
+        self.assertEqual([], runner.commands)
+        self.assertEqual(1, len(created))
+        self.assertFalse(os.path.exists(created[0]))
+
+    def failing_runner(self, runner, predicate, error=None):
+        """Patch runner.run so commands matching predicate raise OSError (or return `error`)."""
+        original_run = runner.run
+
+        def run(command):
+            if predicate(command):
+                runner.commands.append(command)
+                if error is not None:
+                    return error
+                raise OSError(5, "Access is denied")
+            return original_run(command)
+
+        return mock.patch.object(runner, "run", side_effect=run)
+
+    def test_os_error_on_second_create_rolls_back_the_first(self):
+        specs = self.specs()
+        for original in (None, task_xml(specs[0]["executable"], specs[0]["script"], description="original")):
+            with self.subTest(original_owned=original is not None):
+                runner = StatefulTaskRunner({"App Task": original} if original else {})
+                with self.failing_runner(runner, lambda c: "/Create" in c and c[4] == "Watchdog Task"):
+                    with self.assertRaises(win.IntegrationError) as caught:
+                        register(runner, specs)
+                self.assertEqual("schtasks.exe could not be run: [Errno 5] Access is denied", str(caught.exception))
+                self.assertNotIn("Watchdog Task", runner.tasks)
+                if original is None:
+                    self.assertNotIn("App Task", runner.tasks)
+                else:
+                    self.assertEqual(win._xml_signature(original), win._xml_signature(runner.tasks["App Task"]))
+
+    def test_os_error_during_restore_is_reported_as_rollback_failure(self):
+        specs = self.specs()
+        original = task_xml(specs[0]["executable"], specs[0]["script"], description="original")
+        cases = (
+            ({"App Task": original}, lambda c: "/Create" in c and c[4] == "App Task" and len(runner.creates) == 2),
+            ({}, lambda c: "/Delete" in c),
+        )
+        for tasks, predicate in cases:
+            with self.subTest(original_owned=bool(tasks)):
+                runner = StatefulTaskRunner(tasks, fail_create="Watchdog Task")
+                with self.failing_runner(runner, predicate):
+                    with self.assertRaises(win.IntegrationError) as caught:
+                        register(runner, specs)
+                self.assertEqual(
+                    "Task creation failed; rollback verification failed: "
+                    "schtasks.exe could not be run: [Errno 5] Access is denied",
+                    str(caught.exception),
+                )
+                # The rollback could not act, so the new definition is still installed.
+                win.verify_task_definition(runner.tasks["App Task"], specs[0], resolve_sid(specs[0]["user"]), resolve_sid)
+
+    def test_xml_query_spawn_failure_is_unknown_or_a_rollback_failure(self):
+        specs = self.specs()
+        original = task_xml(specs[0]["executable"], specs[0]["script"], description="original")
+        is_xml_query = lambda c: "/Query" in c and "/XML" in c and c[3] == "App Task"
+
+        runner = StatefulTaskRunner({"App Task": original})
+        with self.failing_runner(runner, is_xml_query):
+            with self.assertRaisesRegex(win.IntegrationError, "^Task preflight found foreign or unknown state$"):
+                register(runner, specs)
+        self.assertEqual([], runner.creates)
+
+        runner = StatefulTaskRunner({"App Task": original}, fail_create="Watchdog Task")
+        with self.failing_runner(runner, lambda c: is_xml_query(c) and len(runner.creates) == 3):
+            with self.assertRaises(win.IntegrationError) as caught:
+                register(runner, specs)
+        self.assertEqual(
+            "Task creation failed; rollback verification failed: "
+            "schtasks.exe could not be run: [Errno 5] Access is denied",
+            str(caught.exception),
+        )
+        self.assertEqual(["App Task", "Watchdog Task", "App Task"], [name for name, _data, _path in runner.creates])
+
+    def test_listing_spawn_failure_is_unknown_and_blocks_all_creates(self):
+        specs = self.specs()
+        runner = StatefulTaskRunner()
+        with self.failing_runner(runner, lambda c: "/FO" in c):
+            with self.assertRaisesRegex(win.IntegrationError, "foreign or unknown"):
+                register(runner, specs)
+        self.assertEqual([], runner.creates)
+
+    def test_restore_create_failure_is_reported(self):
+        specs = self.specs()
+        original = task_xml(specs[0]["executable"], specs[0]["script"], description="original")
+        runner = StatefulTaskRunner({"App Task": original}, fail_create="Watchdog Task")
+        refused = win.CommandResult(1, b"", b"refused")
+        restore = lambda c: "/Create" in c and c[4] == "App Task" and len(runner.creates) == 2
+        with self.failing_runner(runner, restore, error=refused):
+            with self.assertRaises(win.IntegrationError) as caught:
+                register(runner, specs)
+        self.assertEqual(
+            "Task creation failed; rollback verification failed: Rollback could not restore the original task",
+            str(caught.exception),
+        )
+        self.assertEqual(["App Task", "Watchdog Task"], [name for name, _data, _path in runner.creates])
+        restore_commands = [c for c in runner.commands if "/Create" in c and c[4] == "App Task"]
+        self.assertEqual(2, len(restore_commands))
+        self.assertFalse(os.path.exists(restore_commands[1][6]))
+        win.verify_task_definition(runner.tasks["App Task"], specs[0], resolve_sid(specs[0]["user"]), resolve_sid)
+
+    def test_restore_readback_mismatch_is_reported(self):
+        specs = self.specs()
+        original = task_xml(specs[0]["executable"], specs[0]["script"], description="original")
+        app_creates = []
+
+        def tamper_restore(name, text):
+            if name == "App Task":
+                app_creates.append(name)
+                if len(app_creates) == 2:
+                    return text.replace("<Description>original</Description>", "<Description>changed</Description>")
+            return text
+
+        runner = StatefulTaskRunner({"App Task": original}, fail_create="Watchdog Task", tamper=tamper_restore)
+        with self.assertRaises(win.IntegrationError) as caught:
+            register(runner, specs)
+        self.assertEqual(
+            "Task creation failed; rollback verification failed: "
+            "Rollback task state does not match the original XML",
+            str(caught.exception),
+        )
+        self.assertEqual(
+            ["App Task", "Watchdog Task", "App Task"], [name for name, _data, _path in runner.creates]
+        )
+        self.assertIn(b"changed", runner.tasks["App Task"])
+
+    def test_unverifiable_created_task_is_named_with_the_code_page_hint(self):
+        specs = self.specs()
+        specs[0]["script"] = r"C:\Café\gmail_app.py"
+        runner = StatefulTaskRunner()
+        with self.assertRaises(win.IntegrationError) as caught:
+            register(runner, specs)
+        self.assertEqual(
+            "Created task 'App Task' could not be verified as this install's task "
+            "(install paths with characters outside the Windows code page cannot be registered)",
+            str(caught.exception),
+        )
+        # Not provably ours, so it is not deleted; nothing else was touched.
+        self.assertIn(rb"C:\Caf?\gmail_app.py", runner.tasks["App Task"])
+        self.assertEqual(["App Task"], [name for name, _data, _path in runner.creates])
+        self.assertFalse(any("/Delete" in command for command in runner.commands))
 
     def test_second_create_failure_deletes_only_new_owned_first_task(self):
         specs = self.specs()
