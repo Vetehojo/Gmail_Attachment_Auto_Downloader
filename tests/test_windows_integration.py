@@ -148,11 +148,21 @@ class ProcessRunner(win.Runner):
 
 
 class DecodeAndTaskParsingTest(unittest.TestCase):
-    def test_decodes_utf16_both_endiannesses_and_cp932(self):
+    def test_decodes_utf16_both_endiannesses(self):
         text = "準備完了"
         self.assertEqual(win.decode_windows_output(b"\xff\xfe" + text.encode("utf-16-le")), text)
         self.assertEqual(win.decode_windows_output(b"\xfe\xff" + text.encode("utf-16-be")), text)
-        self.assertEqual(win.decode_windows_output(text.encode("cp932")), text)
+
+    def test_decodes_cp932_on_japanese_locale_preferred_encoding(self):
+        # On an en-US machine, locale.getpreferredencoding() is cp1252 and the
+        # Windows "mbcs" alias also resolves to cp1252, which decodes every
+        # byte without U+FFFD and wins ahead of cp932 in the candidate list.
+        # Real en-US tools never emit cp932, so this test pins the locale to
+        # a Japanese one (matching the neighboring locale-patched tests) to
+        # exercise the cp932 fallback deterministically on any machine/CI.
+        text = "準備完了"
+        with mock.patch.object(win.locale, "getpreferredencoding", return_value="cp932"):
+            self.assertEqual(win.decode_windows_output(text.encode("cp932")), text)
 
     def test_cp932_wins_when_earlier_locale_candidate_contains_replacement(self):
         text = "準備完了"
