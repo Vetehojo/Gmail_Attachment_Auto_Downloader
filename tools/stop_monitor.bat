@@ -13,7 +13,9 @@ if not exist "%MONITOR_PY%" goto :END_ERROR
 if not exist "%INTEGRATION_PY%" goto :END_ERROR
 
 python "%INTEGRATION_PY%" stop-monitor --script "%MONITOR_PY%"
-if errorlevel 1 goto :END_ERROR
+rem Any exit code but 0 is a failure: a Ctrl+C or crash exit code can be
+rem negative, which "if errorlevel 1" would treat as success.
+if not "%ERRORLEVEL%"=="0" goto :END_ERROR
 
 echo.
 echo Gmail monitor process tree stopped.

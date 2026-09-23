@@ -1,6 +1,7 @@
 """Trial download (gmail_monitor --trial N): newest N attachment mails per account."""
 import base64
 import contextlib
+import functools
 import io
 import json
 import os
@@ -8,6 +9,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from googleapiclient.errors import HttpError
@@ -49,9 +51,10 @@ def message_payload(subject, attachments, date="Tue, 22 Sep 2026 09:00:00 +0900"
 class FakeGmail:
     """users().messages() with list (newest first), get and attachments().get."""
 
-    def __init__(self, messages, gone=(), list_error=None):
+    def __init__(self, messages, gone=(), list_error=None, internal_dates=None):
         self.order = [message_id for message_id, _payload in messages]
         self.payloads = dict(messages)
+        self.internal_dates = internal_dates or {}
         self.gone = set(gone)
         self.list_error = list_error
         self.list_calls = []
@@ -77,7 +80,10 @@ class FakeGmail:
         self.get_calls.append(kwargs["id"])
         if kwargs["id"] in self.gone:
             return Execute(error=not_found())
-        return Execute({"payload": self.payloads[kwargs["id"]]})
+        message = {"payload": self.payloads[kwargs["id"]]}
+        if kwargs["id"] in self.internal_dates:
+            message["internalDate"] = self.internal_dates[kwargs["id"]]
+        return Execute(message)
 
 
 class FakeAttachments:
@@ -254,6 +260,26 @@ class TrialSelectionTest(TrialTestBase):
         self.assertEqual(gmail_monitor.TRIAL_EXIT_OK, code)
         self.assertEqual(100, len(gmail.get_calls))
 
+    def test_file_name_date_is_the_received_time_in_the_pc_timezone(self):
+        # 2026-08-24T15:30Z is already the 25th in Japan; the Date header says 2030.
+        received = str(int(datetime(2026, 8, 24, 15, 30, tzinfo=timezone.utc).timestamp() * 1000))
+        gmail = FakeGmail(
+            [("m1", message_payload("newest", [("a.pdf", "att1")], date="Tue, 1 Jan 2030 12:00:00 +0000"))],
+            internal_dates={"m1": received},
+        )
+        self.use_pool(FakePool({self.ACCOUNT: gmail}))
+        real = gmail_monitor.get_received_date_yyyymmdd
+        jst = timezone(timedelta(hours=9))
+        with mock.patch.object(gmail_monitor, "get_received_date_yyyymmdd", functools.partial(real, tz=jst)):
+            code, out = self.run_cli(1)
+
+        self.assertEqual(gmail_monitor.TRIAL_EXIT_OK, code)
+        [name] = self.saved_files()
+        self.assertIn("_20260825_", name)
+        self.assertIn("2026/08/25 件名「newest」", out)
+        job = self.queue().get_job_by_key(self.job_key("m1", "att1"))
+        self.assertEqual("20260825", job["payload"]["received_date"])
+
     def test_fewer_than_n_when_the_inbox_runs_out_is_not_an_error(self):
         gmail = FakeGmail([("m1", message_payload("only", [("a.pdf", "att1")]))])
         self.use_pool(FakePool({self.ACCOUNT: gmail}))
@@ -302,7 +328,7 @@ class TrialIsolationTest(TrialTestBase):
         self.assertEqual(0, other["attempts"])
         self.assertEqual(["att1"], gmail.attachment_calls)
 
-    def test_metadata_is_unchanged(self):
+    def test_metadata_is_unchanged_except_the_worker_heartbeat(self):
         queue = self.queue()
         for key, value in {
             gmail_monitor.MAIL_CURSOR_KEY: "1700000000",
@@ -316,7 +342,10 @@ class TrialIsolationTest(TrialTestBase):
 
         def snapshot():
             with contextlib.closing(sqlite3.connect(self.queue_db)) as conn:
-                return conn.execute("SELECT key, value, updated_at FROM metadata ORDER BY key").fetchall()
+                return conn.execute(
+                    "SELECT key, value, updated_at FROM metadata WHERE key != ? ORDER BY key",
+                    (gmail_monitor.WORKER_HEARTBEAT_KEY,),
+                ).fetchall()
 
         before = snapshot()
         gmail = self.standard_inbox()
@@ -324,6 +353,41 @@ class TrialIsolationTest(TrialTestBase):
         code, _out = self.run_cli(3)
         self.assertEqual(gmail_monitor.TRIAL_EXIT_OK, code)
         self.assertEqual(before, snapshot())
+        # The watchdog counts the trial process as the monitor: its worker
+        # heartbeat must be fresh, or a running trial would look stalled.
+        self.assertGreater(float(queue.get_metadata(gmail_monitor.WORKER_HEARTBEAT_KEY)), time.time() - 60)
+
+    def journal_phase(self):
+        names = [name for name in os.listdir(self.state) if name.startswith("attachmentjob_")]
+        if not names:
+            return None
+        with open(os.path.join(self.state, names[0]), encoding="utf-8") as handle:
+            return json.load(handle)["phase"]
+
+    def test_worker_heartbeat_at_the_start_and_at_every_job_step(self):
+        gmail = FakeGmail([("m1", message_payload("newest", [("a.pdf", "att1")]))])
+        self.use_pool(FakePool({self.ACCOUNT: gmail}))
+        real_beat = gmail_monitor._worker_beat
+        beats = []
+
+        def beat(queue):
+            beats.append((len(gmail.attachment_calls), len(self.saved_files()), self.journal_phase()))
+            real_beat(queue)
+
+        with mock.patch.object(gmail_monitor, "_worker_beat", side_effect=beat):
+            code, _out = self.run_cli(1)
+
+        self.assertEqual(gmail_monitor.TRIAL_EXIT_OK, code)
+        self.assertEqual(
+            [
+                (0, 0, None),        # trial start
+                (0, 0, None),        # claimed
+                (1, 0, None),        # fetched
+                (1, 1, "prepared"),  # placed
+                (1, 1, "prepared"),  # verified
+            ],
+            beats,
+        )
 
     def test_failed_ignored_and_backoff_jobs_are_reported_not_claimed(self):
         queue = self.queue()

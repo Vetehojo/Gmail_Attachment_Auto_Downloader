@@ -147,6 +147,36 @@ class TempNameTest(unittest.TestCase):
         self.assertEqual(".gadaaaaaa_z", gmail_monitor.temp_file_name(35, "aaaaaa"))
 
 
+class TestSuiteRedirectTest(unittest.TestCase):
+    def test_install_id_file_is_under_the_throwaway_localappdata(self):
+        # tests/__init__.py; off Windows the default would be under the repo's state/.
+        folder = os.path.normcase(os.path.abspath(os.environ["LOCALAPPDATA"]))
+        path = os.path.normcase(os.path.abspath(gmail_monitor.INSTALL_ID_FILE))
+        self.assertTrue(path.startswith(folder + os.sep), path)
+        state_dir = os.path.normcase(os.path.join(app_settings.BASE_DIR, "state"))
+        self.assertFalse(path.startswith(state_dir), path)
+
+
+class NumberedNameTest(TempDirTestCase):
+    def test_unique_path_starts_at_the_given_counter(self):
+        target = os.path.join(self.final, "report.pdf")
+        self.assertEqual(target, gmail_monitor._unique_path(target))
+        self.assertEqual(os.path.join(self.final, "report(3).pdf"), gmail_monitor._unique_path(target, 3))
+        self.write(os.path.join(self.final, "report(3).pdf"), b"x")
+        self.assertEqual(os.path.join(self.final, "report(4).pdf"), gmail_monitor._unique_path(target, 3))
+
+    def test_path_counter(self):
+        rendered = os.path.join(self.final, "report(3).pdf")
+        counter = gmail_monitor._path_counter
+        self.assertEqual(0, counter(rendered, rendered))
+        self.assertEqual(12, counter(os.path.join(self.final, "report(3)(12).pdf"), rendered))
+        for other in ("report.pdf", "report(3)(0).pdf", "report(3)(01).pdf", "report(3)(x).pdf", "other(1).pdf"):
+            with self.subTest(other):
+                self.assertIsNone(counter(os.path.join(self.final, other), rendered))
+        if os.name == "nt":
+            self.assertEqual(2, counter(os.path.join(self.final, "REPORT(3)(2).PDF"), rendered))
+
+
 class RenameNoReplaceTest(TempDirTestCase):
     def test_existing_target_raises_and_both_files_stay(self):
         source = os.path.join(self.final, "source.part")
@@ -179,8 +209,14 @@ class SharedTargetProbeTest(TempDirTestCase):
             gmail_monitor._write_bytes_atomic(b"B content", b_target, 2)
         self.assertEqual(b"B content", self.read(b_target))
         with mock.patch.object(gmail_monitor, "installation_id", return_value="aaaaaa"):
-            with self.assertRaises(FileExistsError):
+            with self.assertRaises(gmail_monitor.TargetTakenError) as ctx:
                 gmail_monitor._write_bytes_atomic(b"A content", a_target, 1)
+        # The error still names the target (and keeps the Windows error code).
+        self.assertIn("report.pdf", str(ctx.exception))
+        self.assertIsInstance(ctx.exception.__cause__, FileExistsError)
+        self.assertEqual(ctx.exception.__cause__.errno, ctx.exception.errno)
+        if os.name == "nt":
+            self.assertEqual(183, ctx.exception.winerror)  # ERROR_ALREADY_EXISTS
         self.assertEqual(b"B content", self.read(target))
         self.assertEqual(["report.pdf"], os.listdir(self.final))
 
@@ -352,6 +388,98 @@ class NoOverwritePlacementTest(TempDirTestCase):
         for target in taken:
             self.assertTrue(self.read(target).startswith(b"other installation"))
         self.assert_no_temp_left()
+
+    def hidden_collisions(self, count):
+        """_rename_no_replace spy: the first `count` moves find the name taken
+        on the share although this client still reports it missing (an SMB
+        negative cache), so the taken file never shows up locally."""
+        real = gmail_monitor._rename_no_replace
+        calls = []
+
+        def rename(source, target):
+            calls.append(target)
+            if len(calls) <= count:
+                raise FileExistsError(17, "File exists", target)
+            return real(source, target)
+
+        return calls, mock.patch.object(gmail_monitor, "_rename_no_replace", side_effect=rename)
+
+    def test_taken_error_keeps_errno_and_file_names(self):
+        target = os.path.join(self.final, "taken.pdf")
+        for error in (FileExistsError(17, "File exists", "source.part", None, target), FileExistsError("text only")):
+            with self.subTest(str(error)):
+                with mock.patch.object(gmail_monitor, "_rename_no_replace", side_effect=error), \
+                     mock.patch.object(gmail_monitor, "installation_id", return_value="aaaaaa"):
+                    with self.assertRaises(gmail_monitor.TargetTakenError) as ctx:
+                        gmail_monitor._write_bytes_atomic(b"x", target, 1)
+                self.assertEqual(str(error), str(ctx.exception))
+                self.assertEqual((error.errno, error.filename, error.filename2),
+                                 (ctx.exception.errno, ctx.exception.filename, ctx.exception.filename2))
+        self.assert_no_temp_left()
+
+    def test_after_a_collision_the_search_goes_on_after_the_taken_name(self):
+        pinned = self.pinned_name()
+        stem, ext = os.path.splitext(pinned)
+        calls, patcher = self.hidden_collisions(2)
+        with patcher:
+            result = gmail_monitor.run_attachment_job(8, AttachmentService(self.DATA), self.payload())
+        # Not the same, still "missing" name again.
+        self.assertEqual([pinned, f"{stem}(1){ext}", f"{stem}(2){ext}"], calls)
+        self.assertEqual(f"{stem}(2){ext}", result["target_path"])
+        self.assertEqual(self.DATA, self.read(result["target_path"]))
+        self.assert_no_temp_left()
+
+    def prepared_journal(self, job_id, target_path):
+        marker = {
+            "success": False,
+            "phase": "prepared",
+            "result": {
+                "hash": hashlib.sha256(self.DATA).hexdigest(),
+                "filename": "document.pdf",
+                "saved_filename": os.path.basename(target_path),
+                "target_path": target_path,
+                "account_email": "a@example.com",
+                "final_dir": os.path.abspath(self.final),
+            },
+        }
+        with open(self.journal_path(job_id), "w", encoding="utf-8") as handle:
+            json.dump(marker, handle)
+
+    def test_a_resumed_journal_name_goes_on_from_its_own_counter(self):
+        stem, ext = os.path.splitext(self.pinned_name())
+        self.prepared_journal(9, f"{stem}(3){ext}")
+        calls, patcher = self.hidden_collisions(1)
+        with patcher:
+            result = gmail_monitor.run_attachment_job(9, AttachmentService(self.DATA), self.payload())
+        self.assertEqual([f"{stem}(3){ext}", f"{stem}(4){ext}"], calls)
+        self.assertEqual(f"{stem}(4){ext}", result["target_path"])
+
+    def test_a_resumed_name_outside_the_current_pattern_restarts_from_the_rendered_name(self):
+        # Journaled under an older file-name setting: the current rendering
+        # cannot produce that name, so its first free name is used.
+        pinned = self.pinned_name()
+        old = os.path.join(os.path.abspath(self.final), "old-style name.pdf")
+        self.prepared_journal(10, old)
+        calls, patcher = self.hidden_collisions(1)
+        with patcher:
+            result = gmail_monitor.run_attachment_job(10, AttachmentService(self.DATA), self.payload())
+        self.assertEqual([old, pinned], calls)
+        self.assertEqual(pinned, result["target_path"])
+
+    def test_file_exists_error_outside_the_move_is_a_normal_retry(self):
+        # e.g. installation_id()'s os.makedirs meets a file where its folder
+        # should be. That is no name collision; the job retries later.
+        pinned = self.pinned_name()
+        error = FileExistsError(17, "File exists", os.path.join(self.root, "GmailAutoDownloader"))
+        with mock.patch.object(gmail_monitor, "installation_id", side_effect=error):
+            with self.assertRaises(FileExistsError) as ctx:
+                gmail_monitor.run_attachment_job(11, AttachmentService(self.DATA), self.payload())
+        self.assertNotIsInstance(ctx.exception, gmail_monitor.TargetTakenError)
+        journal = self.journal(11)
+        self.assertEqual("prepared", journal["phase"])
+        self.assertEqual(pinned, journal["result"]["target_path"])
+        self.assertEqual([], os.listdir(self.final))
+        self.assertNotIn("was taken meanwhile", self.read_log())
 
     def test_the_hash_is_still_verified_after_the_move(self):
         real = gmail_monitor._rename_no_replace

@@ -32,8 +32,9 @@ if not defined PYTHONW goto :PYTHONW_ERROR
 if not exist "%PYTHONW%" goto :PYTHONW_ERROR
 
 echo [2/3] Installing Python packages...
+rem The exact versions tested with this app (requirements.lock).
 pushd "%SDIR%"
-python -m pip install --upgrade -r requirements.txt
+python -m pip install -r requirements.lock
 set "PIP_RESULT=%ERRORLEVEL%"
 popd
 if not "%PIP_RESULT%"=="0" goto :END_ERROR

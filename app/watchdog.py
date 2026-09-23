@@ -229,6 +229,11 @@ def stop_monitor():
     except windows_integration.IntegrationError as exc:
         log_event(f"Monitor stop identity check failed: {exc}")
         return False
+    except OSError as exc:
+        # e.g. PowerShell or taskkill could not be run: a failed stop, so the
+        # caller aborts the restart and main() still saves its state file.
+        log_event(f"Monitor stop failed: {exc}")
+        return False
 
 
 def start_monitor():

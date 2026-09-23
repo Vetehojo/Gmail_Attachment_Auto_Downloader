@@ -19,8 +19,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+      # requirements.lock が全依存を固定していることを、この順で確かめる。
+      # 1. --no-deps で lock の行だけを入れる。依存を解決しないので、lock に
+      #    無いパッケージはここでは入らない（先に依存解決ありで入れると、
+      #    欠けた依存が自動で補われて次の確認が意味を失う）。
+      # 2. pip check は、入れたパッケージが必要とする依存が無い・範囲外なら失敗する。
+      # 3. lock_requirements.py --check は、次のどれかで失敗する（PyPI は見ない）。
+      #    - requirements.txt から辿った依存が入っていない（lock に無い）
+      #    - lock の版が、requirements.txt の範囲か依存元（lock の版）の要求範囲の外
+      #    - lock が、いま入っているものから作り直した lock と一致しない（余分な行など）
+      #    requirements.txt を変えたのに lock を作り直していない場合も、追加した
+      #    パッケージ、範囲外になった版、要らなくなった行があればここで失敗する。
+      # 4. setup.bat と同じコマンドで入れる（すべて導入済みのはず）。
+      # 各ステップは1コマンドにする（pwsh は途中のコマンドの失敗で止まらない）。
+      - name: Install exactly the locked packages
+        run: python -m pip install --no-deps -r requirements.lock
+      - name: Check installed dependencies
+        run: python -m pip check
+      - name: Check requirements.lock is the closure of requirements.txt
+        run: python tools/lock_requirements.py --check
+      - name: Install dependencies as setup.bat does
+        run: python -m pip install -r requirements.lock
       - name: Compile runtime modules
         run: python -m compileall -q app
       - name: Run unit tests

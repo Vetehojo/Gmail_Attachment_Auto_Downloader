@@ -27,7 +27,9 @@ python "%INTEGRATION_PY%" register-tasks ^
     --app-script "%APP_PY%" ^
     --watchdog-script "%WATCHDOG_PY%" ^
     --user "%TASK_USER%"
-if errorlevel 1 goto :END_ERROR
+rem Any exit code but 0 is a failure: a Ctrl+C exit code is negative,
+rem which "if errorlevel 1" would treat as success.
+if not "%ERRORLEVEL%"=="0" goto :END_ERROR
 
 echo.
 echo Registered:
@@ -36,8 +38,9 @@ echo   Gmail Auto Downloader Watchdog - monitor recovery every five minutes
 echo.
 
 rem Start the tray now by running the task just registered. The task runs
-rem non-elevated (/RL LIMITED) in this user's session with the exact registered
-rem command line, even when this window runs as administrator.
+rem with least privilege (RunLevel LeastPrivilege in the task XML) in this
+rem user's session with the exact registered command line, even when this
+rem window runs as administrator.
 "%SCHTASKS%" /Run /TN "Gmail Auto Downloader Monitor" >nul
 if errorlevel 1 (
     echo The tray app could not be started now. It starts at the next logon.
@@ -62,7 +65,9 @@ goto :END_ERROR
 echo.
 echo [ERROR] Failed to register scheduled tasks.
 echo Existing tasks were left untouched unless their executable and script matched this install.
-echo Any partial update was rolled back and verified where possible.
+echo If registration reported an error, any partial update was rolled back and verified where possible.
+echo If this window was interrupted, for example with Ctrl+C, the tasks may be only partly updated.
+echo Run this file again to finish or repair the registration.
 echo When upgrading from the old layout, exit the tray app and delete the old
 echo "Gmail Auto Downloader Monitor" and "Gmail Auto Downloader Watchdog" tasks
 echo in Task Scheduler first, then run this file again.

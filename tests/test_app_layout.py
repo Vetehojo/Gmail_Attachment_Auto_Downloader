@@ -202,6 +202,18 @@ class BatScriptPathTest(unittest.TestCase):
             with self.subTest(rel):
                 self.assertEqual([], [line for line in self._command_lines(rel) if re.match(r"(?i)start\b", line)])
 
+    def test_windows_integration_calls_fail_on_any_nonzero_exit_code(self):
+        # "if errorlevel 1" is false for the negative exit code of a Ctrl+C
+        # or a crash, which would then be reported as success.
+        for rel, command in (
+            ("register_logon_task.bat", 'python "%INTEGRATION_PY%" register-tasks'),
+            (os.path.join("tools", "stop_monitor.bat"), 'python "%INTEGRATION_PY%" stop-monitor'),
+        ):
+            with self.subTest(rel):
+                lines = list(self._command_lines(rel))
+                index = next(i for i, line in enumerate(lines) if line.startswith(command))
+                self.assertEqual('if not "%ERRORLEVEL%"=="0" goto :END_ERROR', lines[index + 1])
+
     def test_register_runs_the_registered_monitor_task_only_after_success(self):
         rel = "register_logon_task.bat"
         lines = list(self._command_lines(rel))
@@ -209,14 +221,25 @@ class BatScriptPathTest(unittest.TestCase):
         self.assertIn(r'set "SCHTASKS=%SystemRoot%\System32\schtasks.exe"', lines)
         self.assertEqual(1, sum("/Run" in line for line in lines))
         register = next(i for i, line in enumerate(lines) if line.startswith('python "%INTEGRATION_PY%" register-tasks'))
-        self.assertEqual("if errorlevel 1 goto :END_ERROR", lines[register + 1])
+        # Not "if errorlevel 1": the negative exit code of a Ctrl+C would pass it.
+        self.assertEqual('if not "%ERRORLEVEL%"=="0" goto :END_ERROR', lines[register + 1])
         # Only the success path reaches the run: after the check, before :END_OK / :END_ERROR.
         self.assertLess(register + 1, lines.index(run))
         self.assertLess(lines.index(run), lines.index(":END_OK"))
         self.assertLess(lines.index(":END_OK"), lines.index(":END_ERROR"))
-        self.assertNotIn("IsUserAnAdmin", self._read(rel).decode("ascii"))
+        text = self._read(rel).decode("ascii")
+        # Only a reported error is rolled back; an interrupted run is not.
+        self.assertNotIn("echo Any partial update was rolled back", text)
+        self.assertIn("echo If registration reported an error, any partial update was rolled back", text)
+        self.assertIn("echo Run this file again to finish or repair the registration.", text)
+        self.assertNotIn("IsUserAnAdmin", text)
+        # The task XML sets the run level; schtasks /RL is no longer used.
+        self.assertNotIn("/RL", text)
+        self.assertIn("RunLevel LeastPrivilege", text)
         with open(os.path.join(APP_DIR, "windows_integration.py"), encoding="utf-8") as handle:
-            self.assertIn('"name": "Gmail Auto Downloader Monitor"', handle.read())
+            source = handle.read()
+        self.assertIn('"name": "Gmail Auto Downloader Monitor"', source)
+        self.assertIn("<RunLevel>LeastPrivilege</RunLevel>", source)
 
 
 if __name__ == "__main__":

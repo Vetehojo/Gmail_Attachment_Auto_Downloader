@@ -15,7 +15,7 @@ import secrets
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from email.utils import parseaddr, parsedate_to_datetime
 
@@ -173,7 +173,21 @@ def extract_sender_email(sender_header):
     return (address or sender_header or "unknown@sender.com").strip()
 
 
-def get_received_date_yyyymmdd(date_header):
+def get_received_date_yyyymmdd(date_header, internal_date=None, tz=None):
+    """The file-name date: when Gmail received the message (its internalDate,
+    milliseconds since the epoch) as a date in `tz`, the PC's local timezone
+    unless a test passes one. Without a usable internalDate: the Date
+    header's own date, else today, as before."""
+    if internal_date is not None:
+        try:
+            millis = int(internal_date)
+            if millis > 0:
+                received = datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
+                return received.astimezone(tz).strftime("%Y%m%d")
+            reason = "not after the epoch"
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            reason = str(exc) or type(exc).__name__
+        log(f"Unusable internalDate {internal_date!r} ({reason}); using the Date header", "scan")
     try:
         return parsedate_to_datetime(date_header).strftime("%Y%m%d")
     except Exception:
@@ -285,7 +299,8 @@ def enqueue_message(queue, service, message_id, account_email="", final_dir=None
     headers = payload.get("headers", [])
     subject = decode_mime_header_value(_header(headers, "subject", "No Subject"))
     sender_email = extract_sender_email(decode_mime_header_value(_header(headers, "from", "")))
-    received_date = get_received_date_yyyymmdd(_header(headers, "date", ""))
+    # format=full includes internalDate. The monitor and the trial both come here.
+    received_date = get_received_date_yyyymmdd(_header(headers, "date", ""), message.get("internalDate"))
 
     common = {
         "account_email": account_email,
@@ -523,14 +538,30 @@ def _file_matches(path, expected_hash):
     return bool(path and expected_hash and os.path.isfile(path) and _sha256_file(path) == expected_hash)
 
 
-def _unique_path(path):
-    if not os.path.exists(path):
+def _numbered_path(path, counter):
+    """path itself for counter 0, else "<stem>(<counter>)<ext>"."""
+    if not counter:
         return path
     base, ext = os.path.splitext(path)
-    counter = 1
-    while os.path.exists(f"{base}({counter}){ext}"):
-        counter += 1
     return f"{base}({counter}){ext}"
+
+
+def _path_counter(path, rendered):
+    """The counter c for which path is _numbered_path(rendered, c), or None."""
+    path, rendered = os.path.normcase(path), os.path.normcase(rendered)
+    if path == rendered:
+        return 0
+    base, ext = os.path.splitext(rendered)
+    match = re.fullmatch(re.escape(base) + r"\(([1-9][0-9]*)\)" + re.escape(ext), path)
+    return int(match.group(1)) if match else None
+
+
+def _unique_path(path, start=0):
+    """The first of _numbered_path(path, start), (start + 1), ... that does not exist."""
+    counter = start
+    while os.path.exists(_numbered_path(path, counter)):
+        counter += 1
+    return _numbered_path(path, counter)
 
 
 def _read_install_id(path):
@@ -606,9 +637,15 @@ def _rename_no_replace(source, target):
         os.remove(source)
 
 
+class TargetTakenError(FileExistsError):
+    """The final move found target_path taken. Only this means "pick another
+    name": a FileExistsError from anything else (e.g. os.makedirs meeting a
+    file where a folder should be) is an ordinary error for the job retry."""
+
+
 def _write_bytes_atomic(data, target_path, job_id):
     """Write data under this installation's temp name next to target_path and
-    move it into place. Never replaces an existing file: FileExistsError when
+    move it into place. Never replaces an existing file: TargetTakenError when
     target_path was taken (e.g. by another installation saving into the same
     folder) after it was chosen."""
     target_dir = os.path.dirname(target_path)
@@ -622,7 +659,15 @@ def _write_bytes_atomic(data, target_path, job_id):
                 os.fsync(handle.fileno())
             except OSError:
                 pass
-        _rename_no_replace(temp, target_path)
+        try:
+            _rename_no_replace(temp, target_path)
+        except FileExistsError as exc:
+            if exc.errno is None:
+                raise TargetTakenError(*exc.args) from exc
+            # Same errno/winerror and file names, so str() still names the target.
+            raise TargetTakenError(
+                exc.errno, exc.strerror, exc.filename, getattr(exc, "winerror", None), exc.filename2
+            ) from exc
     finally:
         try:
             os.remove(temp)
@@ -726,7 +771,7 @@ def _attachment_bytes(service, payload):
     return base64.urlsafe_b64decode(inline_data)
 
 
-def _fresh_target_path(payload, final_dir):
+def _rendered_target_path(payload, final_dir):
     filename = render_filename(
         payload["filename"],
         payload.get("received_date", ""),
@@ -734,7 +779,11 @@ def _fresh_target_path(payload, final_dir):
         payload.get("mail_subject", ""),
         max_filename_length=filename_budget(final_dir),
     )
-    return _unique_path(os.path.join(final_dir, filename))
+    return os.path.join(final_dir, filename)
+
+
+def _fresh_target_path(payload, final_dir):
+    return _unique_path(_rendered_target_path(payload, final_dir))
 
 
 def run_attachment_job(job_id, service, payload, beat=None):
@@ -781,16 +830,20 @@ def run_attachment_job(job_id, service, payload, beat=None):
         atomic_write_json(marker_path, {"success": True, "phase": "committed", "result": result})
         return result
 
-    def relocate():
+    def relocate(collided=False):
         # A save interrupted after "prepared" never wrote the pinned name, so
         # another job -- or another installation saving into the same folder
         # -- may have taken it since. Move to a fresh name from the rendered
-        # base (not name(1)(1)) and persist it before writing. Committed or
-        # legacy journals still stop.
+        # base (not name(1)(1)) and persist it before writing. After a
+        # collision at the move, the search goes on from the counter after
+        # the taken name: an SMB client's negative cache may still report
+        # that name as missing. Committed or legacy journals still stop.
         nonlocal target_path, result
         if not prepared:
             raise RuntimeError(f"保存予定先に別内容のファイルが存在します: {target_path}")
-        target_path = _fresh_target_path(payload, final_dir)
+        rendered = _rendered_target_path(payload, final_dir)
+        taken = _path_counter(target_path, rendered) if collided else None
+        target_path = _unique_path(rendered, 0 if taken is None else taken + 1)
         result = dict(result, saved_filename=os.path.basename(target_path), target_path=target_path)
         atomic_write_json(marker_path, {"success": False, "phase": "prepared", "result": result})
 
@@ -805,11 +858,12 @@ def run_attachment_job(job_id, service, payload, beat=None):
         try:
             _write_bytes_atomic(file_data, target_path, job_id)
             break
-        except FileExistsError:
-            # Taken between the name check and the move; any other OSError
-            # goes to the normal job retry with the journal unchanged.
+        except TargetTakenError:
+            # Taken between the name check and the move; any other OSError,
+            # including another FileExistsError, goes to the normal job
+            # retry with the journal unchanged.
             log(f"Attachment job {job_id}: {os.path.basename(target_path)} was taken meanwhile", "worker")
-            relocate()
+            relocate(collided=True)
     else:
         raise RuntimeError(
             f"保存先で同じ名前のファイルが続けて作られたため、保存できませんでした（{MAX_PLACEMENT_ATTEMPTS}回）: {target_path}"
@@ -908,8 +962,9 @@ def _worker_beat(queue):
 def process_one_job(queue, pool):
     """The monitor's worker path. Besides the job itself it keeps the worker
     heartbeat (at every step of the job) and the tray's authentication issues
-    (runtime_state.AUTH_ISSUES_KEY) current; the trial calls run_claimed_job
-    directly and leaves both alone."""
+    (runtime_state.AUTH_ISSUES_KEY) current; the trial (run_trial_job) calls
+    run_claimed_job with the same heartbeat steps and leaves the
+    authentication issues alone."""
     job = queue.claim_next()
     if job is None:
         return False
@@ -1059,11 +1114,15 @@ def test_recent_emails(max_results):
 # user can check the save folder and file names before automatic fetching
 # starts. It never calls scan_gmail/scan_all_accounts, which advance the mail
 # cursors and write LAST_ERROR_KEY: the trial writes no cursor, pause,
-# LAST_ERROR or WORKER_* metadata, and a job failure is recorded only on the
-# job by the normal job path. It reuses iter_message_ids and run_claimed_job
-# as they are, so heartbeat.json and mail_log.txt are written as usual. Like
-# the monitor, its ServicePool records a mailbox identity on first use for an
-# install from before identities were recorded.
+# LAST_ERROR or WORKER_ERROR metadata, and a job failure is recorded only on
+# the job by the normal job path. It reuses iter_message_ids and
+# run_claimed_job as they are, so heartbeat.json and mail_log.txt are written
+# as usual. The watchdog counts the trial process as the monitor (same
+# script), so the trial keeps WORKER_HEARTBEAT_KEY current like the monitor
+# does (at its start and at every job step); otherwise an unpaused watchdog
+# would stop it as a stalled worker. Like the monitor, its ServicePool records
+# a mailbox identity on first use for an install from before identities were
+# recorded.
 
 TRIAL_TRAY_RUNNING_TEXT = (
     "自動取得（トレイアプリまたは監視プロセス）が動作中です。トレイアプリを終了してから実行してください。\n"
@@ -1150,7 +1209,12 @@ def run_trial_job(queue, pool, job_key):
     if job is not None and job["status"] == "pending" and not job["ignored"]:
         claimed = queue.claim_job(job["id"])
         if claimed is not None:
-            outcome, detail = run_claimed_job(queue, pool, claimed)
+            # The same worker heartbeat steps as process_one_job.
+            def beat():
+                _worker_beat(queue)
+
+            beat()
+            outcome, detail = run_claimed_job(queue, pool, claimed, beat)
             info = {"filename": (claimed.get("payload") or {}).get("filename", "")}
             if outcome == "success":
                 path = detail.get("target_path", "")
@@ -1375,6 +1439,8 @@ def run_trial_cli(count=TRIAL_DEFAULT_MESSAGES):
             print("設定が完了していません。setup.bat を実行して設定を保存してから、もう一度実行してください。")
             return TRIAL_EXIT_BLOCKED
         queue = JobQueue(QUEUE_DB)
+        # Counts as a live worker from the start, as a just-started monitor does.
+        _worker_beat(queue)
         # An interrupted trial (Ctrl+C, closed window) is recovered like a monitor
         # restart, including its temp files; safe while the monitor lock is held.
         recover_interrupted_jobs(queue)

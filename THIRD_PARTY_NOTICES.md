@@ -1,8 +1,10 @@
 # 第三者ソフトウェアのライセンス
 
 本ソフトウェア本体は MIT License で提供する（[LICENSE](LICENSE)）。
-実行には次のパッケージが必要で、これらは `requirements.txt` に従って
-利用者の環境へ個別に導入される。本リポジトリはこれらのコードを同梱しない。
+実行に必要なパッケージは、`setup.bat` が `requirements.lock` に記載した
+固定バージョンで利用者の環境へ個別に導入する。本リポジトリはこれらのコードを同梱しない。
+各パッケージにはそれぞれのライセンスが適用される。主なパッケージを次に示す
+（導入される全パッケージとバージョンは `requirements.lock` を参照）。
 
 | パッケージ | ライセンス | 配布元 |
 | --- | --- | --- |
@@ -12,7 +14,8 @@
 | google-auth-oauthlib | Apache License 2.0 | https://github.com/googleapis/google-auth-library-python-oauthlib |
 | httplib2（google-auth-httplib2 の依存） | MIT License | https://github.com/httplib2/httplib2 |
 | six（pystray の依存） | MIT License | https://github.com/benjaminp/six |
-| Pillow | MIT-CMU License (HPND) | https://github.com/python-pillow/Pillow |
+| certifi（requests の依存） | Mozilla Public License 2.0 | https://github.com/certifi/python-certifi |
+| Pillow | MIT-CMU License | https://github.com/python-pillow/Pillow |
 | **pystray** | **GNU Lesser General Public License v3.0** | https://github.com/moses-palmer/pystray |
 
 ## pystray（LGPL-3.0）についての注意

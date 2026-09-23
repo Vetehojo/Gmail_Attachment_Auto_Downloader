@@ -1,4 +1,7 @@
+import json
 import os
+import tempfile
+import time
 import tkinter as tk
 import unittest
 from types import SimpleNamespace
@@ -142,6 +145,40 @@ class WatchdogOwnershipTest(unittest.TestCase):
         ) as stop:
             self.assertTrue(watchdog.stop_monitor())
         self.assertEqual(watchdog.MONITOR_SCRIPT, stop.call_args.args[3])
+
+    def test_stop_that_cannot_run_is_a_failed_stop(self):
+        error = FileNotFoundError(2, "The system cannot find the file specified", "powershell.exe")
+        with mock.patch.object(watchdog.windows_integration, "stop_owned_monitors", side_effect=error), \
+             mock.patch.object(watchdog, "log_event") as log_event:
+            self.assertFalse(watchdog.stop_monitor())
+        self.assertIn("Monitor stop failed", log_event.call_args.args[0])
+
+    def test_state_file_is_saved_when_the_stop_cannot_run(self):
+        with tempfile.TemporaryDirectory() as root:
+            state_dir = os.path.join(root, "state")
+            state_file = os.path.join(state_dir, "watchdog_state.json")
+            watchdog_log = os.path.join(root, "log", "watchdog_log.txt")
+            with mock.patch.object(watchdog, "STATE_DIR", state_dir), \
+                 mock.patch.object(watchdog, "QUEUE_DB", os.path.join(state_dir, "jobs.sqlite3")), \
+                 mock.patch.object(watchdog, "HEARTBEAT_FILE", os.path.join(state_dir, "heartbeat.json")), \
+                 mock.patch.object(watchdog, "STATE_FILE", state_file), \
+                 mock.patch.object(watchdog, "WATCHDOG_LOG", watchdog_log), \
+                 mock.patch.object(watchdog, "boot_timestamp", return_value=time.time() - 86400), \
+                 mock.patch.object(watchdog, "monitor_pids", return_value=[4242, 4343]), \
+                 mock.patch.object(watchdog.windows_integration, "stop_owned_monitors",
+                                   side_effect=OSError(5, "Access is denied")), \
+                 mock.patch.object(watchdog, "start_monitor") as start, \
+                 mock.patch.object(watchdog, "notify"), \
+                 mock.patch.object(watchdog, "event_log"):
+                # Two monitor processes: a restart that kills them first.
+                self.assertEqual(0, watchdog.main())
+            start.assert_not_called()
+            with open(state_file, encoding="utf-8") as handle:
+                self.assertIn("last_run", json.load(handle))
+            with open(watchdog_log, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("Monitor stop failed", text)
+            self.assertIn("restart aborted", text)
 
     def test_restart_aborts_when_stop_identity_is_unknown(self):
         state = {"restart_times": [], "stale_count": 3}
