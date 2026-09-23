@@ -1,7 +1,7 @@
 """D3: requirements.lock pins the whole runtime dependency closure.
 
 Covers tools/lock_requirements.py (marker evaluation, closure walk, output),
-the committed lock's shape, and that setup.bat and CI install from it.
+the committed lock's shape, and that 1_setup.bat and CI install from it.
 """
 import importlib.util
 import io
@@ -459,8 +459,8 @@ class InstallCommandsTest(unittest.TestCase):
         with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as handle:
             return handle.read()
 
-    def test_setup_bat_installs_from_the_lock(self):
-        lines = [line.strip() for line in self.read("setup.bat").splitlines()]
+    def test_1_setup_bat_installs_from_the_lock(self):
+        lines = [line.strip() for line in self.read("1_setup.bat").splitlines()]
         pip = [line for line in lines if " pip " in f" {line} "]
         self.assertEqual(["python -m pip install -r requirements.lock"], pip)
         index = lines.index(pip[0])

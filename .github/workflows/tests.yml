@@ -30,7 +30,7 @@ jobs:
       #    - lock が、いま入っているものから作り直した lock と一致しない（余分な行など）
       #    requirements.txt を変えたのに lock を作り直していない場合も、追加した
       #    パッケージ、範囲外になった版、要らなくなった行があればここで失敗する。
-      # 4. setup.bat と同じコマンドで入れる（すべて導入済みのはず）。
+      # 4. 1_setup.bat と同じコマンドで入れる（すべて導入済みのはず）。
       # 各ステップは1コマンドにする（pwsh は途中のコマンドの失敗で止まらない）。
       - name: Install exactly the locked packages
         run: python -m pip install --no-deps -r requirements.lock
@@ -38,7 +38,7 @@ jobs:
         run: python -m pip check
       - name: Check requirements.lock is the closure of requirements.txt
         run: python tools/lock_requirements.py --check
-      - name: Install dependencies as setup.bat does
+      - name: Install dependencies as 1_setup.bat does
         run: python -m pip install -r requirements.lock
       - name: Compile runtime modules
         run: python -m compileall -q app

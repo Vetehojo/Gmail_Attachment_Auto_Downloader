@@ -78,7 +78,7 @@ if not "%TRIAL_RESULT%"=="0" (
     echo.
     echo [WARNING] The trial download did not finish cleanly. Exit code: %TRIAL_RESULT%
     echo Your settings are saved. Check the messages above, then run
-    echo trial_download.bat to try again.
+    echo 2_initial_test.bat to try again.
 )
 goto :NEXT_STEPS
 
@@ -90,7 +90,7 @@ echo.
 echo Next steps:
 echo   1. Check the files in the save folder.
 echo   2. Run register_logon_task.bat to register and start automatic fetching.
-echo To run the trial again, use trial_download.bat.
+echo To run the trial again, use 2_initial_test.bat.
 echo It never saves an attachment that was already saved.
 goto :END_OK
 

@@ -947,7 +947,7 @@ class SettingsDialog:
             "メールアドレスの確認", mismatch_confirmation_text(mismatches), parent=self.win
         ):
             return
-        # setup.bat never starts automatic fetching, so --setup only stops a
+        # 1_setup.bat never starts automatic fetching, so --setup only stops a
         # running monitor (a registered watchdog starts it again unless paused).
         restart = not self.setup_only and not self.app.paused()
         try:
@@ -1140,7 +1140,7 @@ class TrayApp:
         except ImportError:
             messagebox.showerror(
                 "Gmail Attachment Downloader",
-                "必要なライブラリ（pystray / Pillow）が見つかりません。setup.bat を実行してから起動し直してください。",
+                "必要なライブラリ（pystray / Pillow）が見つかりません。1_setup.bat を実行してから起動し直してください。",
             )
             self.show_status()
             return

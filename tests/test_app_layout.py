@@ -16,8 +16,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_DIR = os.path.join(REPO_ROOT, "app")
 # Script paths each bat must pass, exactly as written in the bat.
 BAT_SCRIPT_PATHS = {
-    "setup.bat": {r"%~dp0app\gmail_app.py", r"%~dp0app\gmail_monitor.py"},
-    "trial_download.bat": {r"%~dp0app\gmail_monitor.py"},
+    "1_setup.bat": {r"%~dp0app\gmail_app.py", r"%~dp0app\gmail_monitor.py"},
+    "2_initial_test.bat": {r"%~dp0app\gmail_monitor.py"},
     "register_logon_task.bat": {
         r"%~dp0app\gmail_app.py",
         r"%~dp0app\watchdog.py",
@@ -192,10 +192,10 @@ class BatScriptPathTest(unittest.TestCase):
                         self.assertEqual(1, line[: match.start()].count('"') % 2, f"unquoted: {line}")
 
     def test_trial_runs_the_monitor_with_trial_3(self):
-        for rel in ("setup.bat", "trial_download.bat"):
+        for rel in ("1_setup.bat", "2_initial_test.bat"):
             with self.subTest(rel):
                 self.assertIn('python "%MONITOR_PY%" --trial 3', list(self._command_lines(rel)))
-        self.assertEqual("exit /b %EXIT_CODE%", list(self._command_lines("trial_download.bat"))[-1])
+        self.assertEqual("exit /b %EXIT_CODE%", list(self._command_lines("2_initial_test.bat"))[-1])
 
     def test_no_bat_starts_the_tray_directly(self):
         for rel in BAT_SCRIPT_PATHS:

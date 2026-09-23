@@ -1436,7 +1436,7 @@ def run_trial_cli(count=TRIAL_DEFAULT_MESSAGES):
             print(TRIAL_TRAY_RUNNING_TEXT)
             return TRIAL_EXIT_BLOCKED
         if not is_configured():
-            print("設定が完了していません。setup.bat を実行して設定を保存してから、もう一度実行してください。")
+            print("設定が完了していません。1_setup.bat を実行して設定を保存してから、もう一度実行してください。")
             return TRIAL_EXIT_BLOCKED
         queue = JobQueue(QUEUE_DB)
         # Counts as a live worker from the start, as a just-started monitor does.

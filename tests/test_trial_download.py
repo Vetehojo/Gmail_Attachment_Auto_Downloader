@@ -709,7 +709,7 @@ class TrialLockTest(TrialTestBase):
         with mock.patch.object(gmail_monitor, "is_configured", return_value=False):
             code, out = self.run_cli(3)
         self.assertEqual(gmail_monitor.TRIAL_EXIT_BLOCKED, code)
-        self.assertIn("setup.bat", out)
+        self.assertIn("1_setup.bat", out)
         self.assertFalse(os.path.exists(self.queue_db))
 
 
