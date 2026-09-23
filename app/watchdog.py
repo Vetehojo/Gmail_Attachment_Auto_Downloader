@@ -11,7 +11,7 @@ import time
 
 import app_settings
 from job_queue import JobQueue
-from runtime_state import append_log, read_heartbeat
+from runtime_state import append_log, read_heartbeat, settings_update_in_progress
 import windows_integration
 
 
@@ -113,6 +113,15 @@ def is_paused():
         return False
 
 
+def is_settings_update():
+    """The settings dialog is stopping the monitor to commit new settings."""
+    try:
+        return settings_update_in_progress(JobQueue(QUEUE_DB))
+    except Exception as exc:
+        log_event(f"Failed to read settings update state: {exc}")
+        return False
+
+
 def powershell(script):
     result = _run_hidden(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
@@ -188,7 +197,7 @@ def can_restart(state, now):
 
 
 def perform_restart(state, reason, now, kill_existing=False):
-    if is_paused():
+    if is_paused() or is_settings_update():
         state["stale_count"] = 0
         return
     if not can_restart(state, now):
@@ -232,6 +241,12 @@ def main():
         save_state(state)
         return 0
     state.pop("paused", None)
+
+    # A Save stops the monitor on purpose and restarts it itself.
+    if is_settings_update():
+        state["stale_count"] = 0
+        save_state(state)
+        return 0
 
     if previous_run and now - previous_run > RESUME_GAP_SECONDS:
         state["grace_until"] = now + RESUME_GRACE_SECONDS

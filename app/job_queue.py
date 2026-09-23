@@ -167,6 +167,20 @@ class JobQueue:
             )
             return "retry"
 
+    def fail_job(self, job_id, error):
+        """Fail a claimed job now, whatever attempts remain (it can never succeed as is)."""
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed', last_error = ?, updated_at = ?
+                WHERE id = ? AND status = 'processing' AND ignored = 0
+                """,
+                (str(error)[:4000], now, int(job_id)),
+            )
+            return cur.rowcount == 1
+
     def defer_job(self, job_id, error, delay=900):
         """Retry later without consuming an attempt (authentication/config outage)."""
         now = time.time()

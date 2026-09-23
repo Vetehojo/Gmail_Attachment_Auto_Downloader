@@ -24,13 +24,25 @@ from app_settings import (
     load_dwd_accounts,
     load_settings,
     normalize_auth_mode,
+    normalize_dwd_accounts,
     parse_csv_setting,
     parse_scan_start,
     save_settings,
 )
 from filename_rules import preview_filename, validate_template
 from job_queue import JobQueue
-from runtime_state import SingleInstance, append_log, read_heartbeat
+from runtime_state import (
+    AUTH_ISSUES_KEY,
+    SingleInstance,
+    append_log,
+    begin_settings_update,
+    end_settings_update,
+    format_auth_issues,
+    identity_key,
+    read_auth_issues,
+    read_heartbeat,
+    settings_update_in_progress,
+)
 import windows_integration
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -79,6 +91,191 @@ def cursor_key(email, mode):
     if normalize_auth_mode(mode) == AUTH_DWD:
         return f"{MAIL_CURSOR_KEY}:{str(email or '').strip().lower()}"
     return MAIL_CURSOR_KEY
+
+
+def check_scan_start(start):
+    if start > datetime.now():
+        raise ValueError("未来の日付は指定できません。")
+
+
+def write_scan_start(q, start, settings):
+    """Set every account's mail cursor in `settings` to just after `start`.
+
+    lookback_days only bounds a cursor-less first scan (see gmail_monitor's
+    scan_gmail). This always writes an explicit cursor for every account, so
+    lookback_days is never consulted here; bumping it used to just leak a
+    permanently larger window into later cursor-less scans for no benefit.
+    """
+    mode = normalize_auth_mode(settings.get("auth_mode"))
+    timestamp = (start + timedelta(minutes=5)).timestamp()
+    for account in get_account_configs(settings):
+        q.set_metadata(cursor_key(account["email"], mode), timestamp)
+
+
+SAVED_LATER_TEXT = "設定はまだ保存していません。「保存」を押すと反映します。"
+STOP_FAILED_TEXT = (
+    "自動取得（監視プロセス）を停止できなかったため、設定を保存しませんでした。"
+    "しばらく待ってから、もう一度保存してください。"
+)
+
+
+def _path_key(path):
+    path = str(path or "").strip()
+    return os.path.normcase(os.path.abspath(path)) if path else ""
+
+
+def stage_matches(staged, inputs):
+    """Whether a connection-test result still describes the dialog's inputs:
+    OAuth by client JSON and target address, DWD by service-account JSON."""
+    if not staged:
+        return False
+    if staged["mode"] == AUTH_DWD:
+        return _path_key(staged["service_account"]) == _path_key(inputs["service_account"])
+    return (
+        _path_key(staged["client"]) == _path_key(inputs["client"])
+        and staged["email"] == inputs["email"]
+    )
+
+
+def run_connection_test(snapshot):
+    """The settings dialog's connection test on a snapshot of its unsaved values.
+
+    Writes nothing: no config.ini, credential copy, token.json, folder, cursor
+    or queue metadata, and the monitor keeps running. Returns the message box
+    ("level", "title", "text") and "staged": what Save may commit - the
+    verified mailbox identity per account and, after a new OAuth login, its
+    in-memory credentials ("creds") - or None.
+    """
+    from gmail_auth import dwd_connection_test, oauth_connection_test, verify_profile_account
+
+    if snapshot["mode"] == AUTH_DWD:
+        identities = {}
+        failures = []
+        for email, profile, error in dwd_connection_test(snapshot["service_account"], snapshot["accounts"]):
+            actual = str((profile or {}).get("emailAddress") or "").strip().lower()
+            if error is not None:
+                failures.append(f"{email}: {error}")
+            elif not actual:
+                failures.append(f"{email}: Gmailがメールアドレスを返しませんでした。")
+            else:
+                identities[email] = actual
+        staged = None
+        if identities:
+            staged = {"mode": AUTH_DWD, "service_account": snapshot["service_account"], "identities": identities}
+        if failures:
+            text = f"成功 {len(identities)} / 失敗 {len(failures)}\n\n" + "\n".join(failures[:10])
+            return {"level": "error", "title": "接続失敗", "text": text, "staged": staged}
+        text = f"DWD接続成功: {len(identities)}アカウント\n{SAVED_LATER_TEXT}"
+        return {"level": "info", "title": "接続成功", "text": text, "staged": staged}
+
+    expected = snapshot["email"]
+    profile, login, note = oauth_connection_test(
+        snapshot["client"], snapshot["force_login"], snapshot["staged_creds"]
+    )
+    actual = str((profile or {}).get("emailAddress") or "").strip().lower()
+    if not actual:
+        raise RuntimeError("Gmailがログインしたアカウントのメールアドレスを返しませんでした。")
+    staged = {
+        "mode": AUTH_OAUTH,
+        "client": snapshot["client"],
+        "email": expected,
+        "creds": login,
+        "identities": {expected: actual},
+    }
+    lines = [f"{note}ため、ブラウザでログインしました。"] if note else []
+    ok, _actual = verify_profile_account(profile, expected)
+    if not ok:
+        lines += [
+            "Gmail APIには接続できましたが、ログインしたGoogleアカウントのメールアドレスが入力値と異なります。",
+            f"入力したメールアドレス: {expected}",
+            f"ログインしたアカウント: {actual}",
+            "入力したアドレスがこのアカウントの別名（エイリアス）でなければ、"
+            "「別のGoogleアカウントでログインし直す」をオンにして、もう一度テストしてください。"
+            "このまま保存すると、このアカウントのメールボックスを入力したメールアドレスの取得先として記録します。",
+            SAVED_LATER_TEXT,
+        ]
+        return {"level": "warning", "title": "メールアドレス不一致", "text": "\n".join(lines), "staged": staged}
+    lines += ["Gmail APIに接続できました。", actual]
+    if login is not None:
+        lines.append("ログインした認証情報は「保存」を押したときに保存します。")
+    lines.append(SAVED_LATER_TEXT)
+    return {"level": "info", "title": "接続成功", "text": "\n".join(lines), "staged": staged}
+
+
+def plan_identity_writes(account_ids, previous_ids, verified, stored):
+    """Mailbox identities Save records, as {account: value}.
+
+    An address a connection test verified is recorded. An account this Save
+    adds without one gets "" - the monitor refuses it until it is tested and
+    saved - unless an identity is already stored for it. Accounts configured
+    before keep what they have, so an install from before identities were
+    recorded stays trust-on-first-use.
+    """
+    previous = set(previous_ids)
+    writes = {}
+    for account in account_ids:
+        if verified.get(account):
+            writes[account] = verified[account]
+        elif account not in previous and stored(account) is None:
+            writes[account] = ""
+    return writes
+
+
+def commit_settings(plan, q):
+    """Write a validated Save plan while the monitor is stopped: credential
+    files, token, identities and cursors first, config.ini last."""
+    if plan["create_dir"]:
+        os.makedirs(plan["create_dir"], exist_ok=True)
+    if plan["mode"] == AUTH_DWD:
+        copy_service_account(plan["source"])
+    else:
+        copy_credentials(plan["source"])
+    if plan["token"] is not None:
+        from gmail_auth import install_oauth_token
+        install_oauth_token(plan["token"])
+    for account, value in plan["identity_writes"].items():
+        q.set_metadata(identity_key(account), value)
+    # Deferrals recorded under the old settings; a job still failing re-records one.
+    q.delete_metadata(AUTH_ISSUES_KEY)
+    if plan["scan_start"] is not None:
+        write_scan_start(q, plan["scan_start"], plan["values"])
+    save_settings(plan["values"])
+
+
+def apply_settings_update(plan, controller, q, restart):
+    """Save's stop -> commit -> restart. Returns "" on success, else the error to show.
+
+    The settings-update marker keeps the watchdog and the tray's health tick
+    from starting the monitor meanwhile. Nothing is written unless the monitor
+    is confirmed stopped. A failed commit still restarts it (when `restart`)
+    and is reported.
+    """
+    begin_settings_update(q)
+    error = None
+    try:
+        if not controller.stop_all():
+            log("Settings save aborted: the monitor could not be stopped", "settings")
+            return STOP_FAILED_TEXT
+        try:
+            commit_settings(plan, q)
+        except Exception as exc:
+            log(f"Settings commit failed: {exc}", "settings")
+            error = exc
+    finally:
+        try:
+            end_settings_update(q)
+        except Exception as exc:
+            # It expires on its own after SETTINGS_UPDATE_SECONDS.
+            log(f"Settings update marker could not be cleared: {exc}", "settings")
+    if restart:
+        controller.start()
+    if error is not None:
+        resumed = "自動取得は再開しています。" if restart else ""
+        return (
+            "設定の保存中にエラーが発生しました。一部の認証情報だけが保存された可能性があります。"
+            f"内容を確認して、もう一度保存してください。{resumed}\n{error}"
+        )
+    return ""
 
 
 class MonitorController:
@@ -310,7 +507,17 @@ class SettingsDialog:
         self.preview = tk.StringVar()
         self.period = tk.StringVar(value="過去7日")
         self.custom_date = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        self.force_login = tk.BooleanVar(value=False)
+        # The last connection test's result (see run_connection_test), kept in
+        # memory only until Save; dropped on Cancel or when it no longer
+        # matches the inputs it was made for.
+        self._staged = None
+        self._closed = False
+        self._test_running = False
+        self._test_generation = 0
         self._build()
+        for variable in (self.email, self.credentials, self.service_account):
+            variable.trace_add("write", self._discard_stale_stage)
         self._refresh_preview()
         self._refresh_auth_mode()
         self.win.update_idletasks()
@@ -359,9 +566,13 @@ class SettingsDialog:
         self._entry_row(self.oauth_frame, 0, "対象メールアドレス", self.email)
         self._entry_row(self.oauth_frame, 1, "添付ファイルの保存先", self.final, lambda: self._pick_dir(self.final))
         self._entry_row(self.oauth_frame, 2, "OAuthクライアントJSONファイル", self.credentials, self._pick_credentials)
-        ttk.Button(self.oauth_frame, text="Googleに接続してテスト", command=self._connection_test).grid(
-            row=3, column=1, sticky="w", padx=8, pady=8
-        )
+        test_bar = ttk.Frame(self.oauth_frame)
+        test_bar.grid(row=3, column=1, sticky="w", padx=8, pady=8)
+        self.oauth_test_button = ttk.Button(test_bar, text="Googleに接続してテスト", command=self._connection_test)
+        self.oauth_test_button.pack(side="left")
+        ttk.Checkbutton(
+            test_bar, text="別のGoogleアカウントでログインし直す", variable=self.force_login
+        ).pack(side="left", padx=(12, 0))
 
         self.dwd_frame = ttk.LabelFrame(basic, text="Google Workspace（ドメイン全体の委任）の設定")
         self.dwd_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=8)
@@ -394,9 +605,10 @@ class SettingsDialog:
         ttk.Button(controls, text="追加", command=self._add_dwd_account).pack(side="left", padx=3)
         ttk.Button(controls, text="編集", command=self._edit_dwd_account).pack(side="left", padx=3)
         ttk.Button(controls, text="削除", command=self._delete_dwd_account).pack(side="left", padx=3)
-        ttk.Button(
+        self.dwd_test_button = ttk.Button(
             controls, text="登録した全アカウントに接続してテスト", command=self._connection_test
-        ).pack(side="left", padx=(18, 3))
+        )
+        self.dwd_test_button.pack(side="left", padx=(18, 3))
         self._refresh_account_tree()
 
         common_frame = ttk.LabelFrame(basic, text="取り込み条件（共通）")
@@ -467,7 +679,8 @@ class SettingsDialog:
         bar = ttk.Frame(self.win)
         self.footer = bar
         ttk.Button(bar, text="キャンセル", command=self.close).pack(side="right", padx=4)
-        ttk.Button(bar, text="保存", command=self.save).pack(side="right", padx=4)
+        self.save_button = ttk.Button(bar, text="保存", command=self.save)
+        self.save_button.pack(side="right", padx=4)
         # Reserve the footer first. The notebook may request a taller page when
         # OAuth/DWD or tabs change, but it can only consume the remaining client
         # area and therefore cannot push Save/Cancel below the window edge.
@@ -594,106 +807,177 @@ class SettingsDialog:
             raise ValueError("ファイル名に使う件名の最大文字数は0～200で指定してください。")
         return values
 
-    def _persist(self):
+    def _inputs(self):
+        return {
+            "email": self.email.get().strip().lower(),
+            "client": self.credentials.get().strip(),
+            "service_account": self.service_account.get().strip(),
+        }
+
+    def _discard_stale_stage(self, *_args):
+        if self._staged is not None and not stage_matches(self._staged, self._inputs()):
+            self._staged = None
+
+    def _save_plan(self):
+        """Validate every value and describe what Save commits. No side effects."""
         values = self._common_values()
-        if values["auth_mode"] == AUTH_DWD:
+        mode = values["auth_mode"]
+        inputs = self._inputs()
+        staged = self._staged if stage_matches(self._staged, inputs) and self._staged["mode"] == mode else None
+        create_dir = None
+        if mode == AUTH_DWD:
             if not self.dwd_accounts:
                 raise ValueError("処理対象のアカウントを1件以上登録してください。")
-            source = self.service_account.get().strip()
+            source = inputs["service_account"]
             if not source or not os.path.isfile(source):
                 raise ValueError("サービスアカウントJSONファイルを指定してください。")
-            copy_service_account(source)
-            self.service_account.set(SERVICE_ACCOUNT_PATH)
-            encoded = encode_dwd_accounts(self.dwd_accounts)
             # target_email/final_dir are OAuth-only fields (see get_account_configs
             # and is_configured). Copying the first DWD account into them used to be
             # a "keep legacy modules loadable" hack; the legacy module is gone, so
             # doing this now only pre-fills the OAuth form with stale DWD data if
             # the user switches auth mode back. Leave them untouched here.
-            values.update({
-                "dwd_accounts": encoded,
-            })
+            values["dwd_accounts"] = encode_dwd_accounts(self.dwd_accounts)
+            accounts = normalize_dwd_accounts(self.dwd_accounts)
         else:
-            email = self.email.get().strip().lower()
+            email = inputs["email"]
             final_dir = self.final.get().strip()
-            source = self.credentials.get().strip()
+            source = inputs["client"]
             if "@" not in email:
                 raise ValueError("対象メールアドレスを正しく入力してください。（例: office@example.com）")
             if not final_dir:
                 raise ValueError("添付ファイルの保存先を指定してください。")
             if not source or not os.path.isfile(source):
                 raise ValueError("OAuthクライアントJSONファイルを指定してください。")
-            os.makedirs(final_dir, exist_ok=True)
-            copy_credentials(source)
+            create_dir = os.path.abspath(final_dir)
             values.update({
                 "target_email": email,
-                "final_dir": os.path.abspath(final_dir),
+                "final_dir": create_dir,
                 "dwd_accounts": encode_dwd_accounts(self.dwd_accounts) if self.dwd_accounts else "[]",
             })
-        save_settings(values)
+            accounts = [{"email": email, "final_dir": create_dir}]
+        scan_start = None
         if self.initial:
-            self.app.apply_scan_start(parse_scan_start(self.period.get(), self.custom_date.get()))
-        return values
+            scan_start = parse_scan_start(self.period.get(), self.custom_date.get())
+            check_scan_start(scan_start)
+        q = queue()
+        identity_writes = plan_identity_writes(
+            [account["email"] for account in accounts],
+            [account["email"] for account in get_account_configs(load_settings())],
+            (staged or {}).get("identities", {}),
+            lambda account: q.get_metadata(identity_key(account)),
+        )
+        return {
+            "mode": mode,
+            "values": values,
+            "source": source,
+            "create_dir": create_dir,
+            "token": (staged or {}).get("creds"),
+            "identity_writes": identity_writes,
+            "scan_start": scan_start,
+        }
 
     def save(self):
+        if self._test_running:
+            return
         try:
-            self._persist()
+            plan = self._save_plan()
         except Exception as exc:
             messagebox.showerror("設定内容の確認", str(exc), parent=self.win)
             return
-        if not self.setup_only and not self.app.paused():
-            self.app.controller.restart()
-        messagebox.showinfo("保存", "設定を保存しました。", parent=self.win)
+        # setup.bat never starts automatic fetching, so --setup only stops a
+        # running monitor (a registered watchdog starts it again unless paused).
+        restart = not self.setup_only and not self.app.paused()
+        try:
+            error = apply_settings_update(plan, self.app.controller, queue(), restart)
+        except Exception as exc:
+            log(f"Settings save failed: {exc}", "settings")
+            error = str(exc)
+        if error:
+            messagebox.showerror("設定を保存できませんでした", error, parent=self.win)
+            return
+        text = "設定を保存しました。"
+        unverified = [account for account, value in plan["identity_writes"].items() if not value]
+        if unverified:
+            text += (
+                "\n\n接続テストで確認していないアカウントがあります: " + ", ".join(unverified)
+                + "\n接続テストを実行して保存し直すまで、これらのアカウントの取得は保留します。"
+            )
+        messagebox.showinfo("保存", text, parent=self.win)
         self.close()
 
+    def _test_snapshot(self):
+        """The test's inputs, read here on the Tk main thread."""
+        mode = normalize_auth_mode(self.auth_mode.get())
+        inputs = self._inputs()
+        if mode == AUTH_DWD:
+            if not self.dwd_accounts:
+                raise ValueError("処理対象のアカウントを1件以上登録してください。")
+            source = inputs["service_account"]
+            if not source or not os.path.isfile(source):
+                raise ValueError("サービスアカウントJSONファイルを指定してください。")
+            return {
+                "mode": AUTH_DWD,
+                "service_account": os.path.abspath(source),
+                "accounts": [account["email"] for account in self.dwd_accounts],
+            }
+        if "@" not in inputs["email"]:
+            raise ValueError("対象メールアドレスを正しく入力してください。（例: office@example.com）")
+        source = inputs["client"]
+        if not source or not os.path.isfile(source):
+            raise ValueError("OAuthクライアントJSONファイルを指定してください。")
+        staged = self._staged if stage_matches(self._staged, inputs) and self._staged["mode"] == AUTH_OAUTH else None
+        return {
+            "mode": AUTH_OAUTH,
+            "email": inputs["email"],
+            "client": os.path.abspath(source),
+            "force_login": bool(self.force_login.get()),
+            "staged_creds": (staged or {}).get("creds"),
+        }
+
+    def _set_testing(self, running):
+        # Save stays disabled while a browser login may still be completing.
+        self._test_running = running
+        for button in (self.save_button, self.oauth_test_button, self.dwd_test_button):
+            button.state(["disabled"] if running else ["!disabled"])
+
     def _connection_test(self):
+        if self._test_running:
+            return
         try:
-            values = self._persist()
+            snapshot = self._test_snapshot()
         except Exception as exc:
             messagebox.showerror("設定内容の確認", str(exc), parent=self.win)
             return
+        self._test_generation += 1
+        generation = self._test_generation
+        self._set_testing(True)
 
         def work():
             try:
-                from gmail_auth import test_gmail_service, verify_profile_account
-                mode = normalize_auth_mode(values.get("auth_mode"))
-                if mode == AUTH_DWD:
-                    successes = []
-                    failures = []
-                    for account in get_account_configs(load_settings()):
-                        try:
-                            _service, profile = test_gmail_service(account["email"], False, AUTH_DWD)
-                            successes.append(profile.get("emailAddress", account["email"]))
-                        except Exception as exc:
-                            failures.append(f"{account['email']}: {exc}")
-                    if failures:
-                        raise RuntimeError(
-                            f"成功 {len(successes)} / 失敗 {len(failures)}\n\n" + "\n".join(failures[:10])
-                        )
-                    text = f"DWD接続成功: {len(successes)}アカウント"
-                    self.app.root.after(0, lambda: messagebox.showinfo("接続成功", text, parent=self.win))
-                    return
-                expected_email = values.get("target_email", "")
-                _service, profile = test_gmail_service(expected_email, True, AUTH_OAUTH)
-                ok, actual_email = verify_profile_account(profile, expected_email)
-                if not ok:
-                    warning = (
-                        "Gmail APIには接続できましたが、認証されたメールアドレスが入力値と異なります。\n"
-                        f"入力したメールアドレス: {expected_email}\n"
-                        f"実際に認証されたメールアドレス: {actual_email}\n"
-                        "今後読み込まれるのは実際に認証されたメールボックスです。"
-                        "入力欄の値は上書きしていません。"
-                    )
-                    self.app.root.after(0, lambda: messagebox.showwarning("メールアドレス不一致", warning, parent=self.win))
-                    return
-                text = f"Gmail APIに接続できました。\n{actual_email or profile.get('emailAddress', '認証済み')}"
-                self.app.root.after(0, lambda: messagebox.showinfo("接続成功", text, parent=self.win))
+                result = run_connection_test(snapshot)
             except Exception as exc:
-                self.app.root.after(0, lambda error=exc: messagebox.showerror("接続失敗", str(error), parent=self.win))
+                result = {"level": "error", "title": "接続失敗", "text": str(exc), "staged": None}
+            self.app.root.after(0, lambda: self._finish_test(generation, result))
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _finish_test(self, generation, result):
+        if self._closed or generation != self._test_generation:
+            return  # Cancelled meanwhile: the result, including any login, is dropped.
+        self._set_testing(False)
+        staged = result.get("staged")
+        text = result["text"]
+        if staged is not None and not stage_matches(staged, self._inputs()):
+            staged = None
+            text += "\n\nテスト中に入力内容が変わったため、この結果は保存に使いません。もう一度テストしてください。"
+        # Save commits only what the latest test showed.
+        self._staged = staged
+        show = {"info": messagebox.showinfo, "warning": messagebox.showwarning}.get(result["level"], messagebox.showerror)
+        show(result["title"], text, parent=self.win)
+
     def close(self):
+        self._closed = True
+        self._staged = None
         if self.win.winfo_exists():
             self.win.destroy()
         if self.setup_only:
@@ -717,6 +1001,7 @@ class TrayApp:
         self.last_failed_count = -1
         self.last_monitor_error = ""
         self.last_worker_issue = ""
+        self.last_auth_issue = ""
         self._startup_notice = ""
         self.instance = SingleInstance("Local\\GmailAutoDownloaderTray", APP_LOCK_FILE)
 
@@ -764,22 +1049,9 @@ class TrayApp:
             q.set_metadata(PAUSED_KEY, "0")
 
     def apply_scan_start(self, start):
-        now = datetime.now()
-        if start > now:
-            raise ValueError("未来の日付は指定できません。")
+        check_scan_start(start)
         self.controller.stop_all()
-        # lookback_days only bounds a cursor-less first scan (see gmail_monitor's
-        # scan_gmail). This rescan always writes an explicit cursor for every
-        # account below, so lookback_days is never consulted here; bumping it
-        # used to just leak a permanently larger window into later cursor-less
-        # scans for no benefit. Removed rather than "restored" since the
-        # simplest correct behaviour is to not touch it at all.
-        settings = load_settings()
-        mode = normalize_auth_mode(settings.get("auth_mode"))
-        timestamp = (start + timedelta(minutes=5)).timestamp()
-        q = queue()
-        for account in get_account_configs(settings):
-            q.set_metadata(cursor_key(account["email"], mode), timestamp)
+        write_scan_start(queue(), start, load_settings())
 
     @staticmethod
     def _make_icon(error=False):
@@ -870,7 +1142,9 @@ class TrayApp:
 
     def _health_tick(self):
         try:
-            if is_configured() and not self.paused():
+            q = queue()
+            # A Save in progress stops the monitor on purpose and restarts it itself.
+            if is_configured() and not self.paused() and not settings_update_in_progress(q):
                 heartbeat = read_heartbeat(HEARTBEAT_FILE)
                 heartbeat_fresh = False
                 if heartbeat:
@@ -884,7 +1158,6 @@ class TrayApp:
                 # when the heartbeat looks stale or missing.
                 if not heartbeat_fresh:
                     self.controller.start()
-            q = queue()
             counts = q.counts()
             monitor_error = q.get_metadata(LAST_ERROR_KEY, "") or ""
             # While paused the monitor is deliberately stopped, so pending jobs
@@ -892,7 +1165,8 @@ class TrayApp:
             # turn the tray red and fire a notification every time the user
             # pauses or exits, which is exactly when they know it is stopped.
             worker_issue = "" if self.paused() else self._worker_issue(counts)
-            has_error = counts["failed"] > 0 or bool(monitor_error) or bool(worker_issue)
+            auth_issue = "" if self.paused() else format_auth_issues(read_auth_issues(q))
+            has_error = counts["failed"] > 0 or bool(monitor_error) or bool(worker_issue) or bool(auth_issue)
             if self.tray is not None:
                 if self.paused():
                     # Every tick otherwise overwrites this with the plain title
@@ -928,9 +1202,15 @@ class TrayApp:
                         self.tray.notify(worker_issue[:180], "添付の保存処理が停止しています")
                     except Exception:
                         pass
+                if auth_issue and auth_issue != self.last_auth_issue:
+                    try:
+                        self.tray.notify(auth_issue[:180], "Gmail認証の確認が必要です")
+                    except Exception:
+                        pass
             self.last_failed_count = counts["failed"]
             self.last_monitor_error = monitor_error
             self.last_worker_issue = worker_issue
+            self.last_auth_issue = auth_issue
         finally:
             if self.root.winfo_exists():
                 self.root.after(30000, self._health_tick)
@@ -1018,10 +1298,11 @@ class TrayApp:
             monitor_error = q.get_metadata(LAST_ERROR_KEY, "") or ""
             # Paused is an intended state, not a worker fault - see _health_tick.
             worker_issue = "" if self.paused() else self._worker_issue(counts)
+            auth_issue = format_auth_issues(read_auth_issues(q))
             values["mode"].set(("Google Workspace DWD" if mode == AUTH_DWD else "OAuth") + f" / {len(accounts)}アカウント")
             if self.paused():
                 health = "一時停止中"
-            elif monitor_error or counts["failed"] or worker_issue:
+            elif monitor_error or counts["failed"] or worker_issue or auth_issue:
                 health = "要確認"
             elif heartbeat:
                 age = time.time() - float(heartbeat.get("timestamp", 0))
@@ -1043,6 +1324,8 @@ class TrayApp:
                 reasons.append(f"Gmailへの接続でエラーが出ています: {monitor_error}")
             if worker_issue:
                 reasons.append(worker_issue)
+            if auth_issue:
+                reasons.append(f"認証の確認が必要なため、保存を保留している添付があります: {auth_issue}")
             heartbeat_detail = (heartbeat or {}).get("detail", "")
             if not reasons and heartbeat_detail:
                 reasons.append(heartbeat_detail)
@@ -1051,7 +1334,7 @@ class TrayApp:
             values["jobs"].set(
                 "待機 {pending} / 処理中 {processing} / 成功 {success} / 失敗 {failed} / 無視 {ignored}".format(**counts)
             )
-            values["error"].set(" / ".join(filter(None, [monitor_error, worker_issue])) or "-")
+            values["error"].set(" / ".join(filter(None, [monitor_error, worker_issue, auth_issue])) or "-")
             win.after(3000, refresh)
 
         refresh()

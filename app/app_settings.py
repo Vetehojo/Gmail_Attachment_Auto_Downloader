@@ -1,4 +1,5 @@
 import configparser
+import hashlib
 import json
 import os
 import re
@@ -171,6 +172,21 @@ def _copy_private_json(source_path, target_path):
         shutil.copy2(source, tmp)
         os.replace(tmp, target)
     protect_private_file(target)
+
+
+def credential_file_digest(auth_mode):
+    """SHA-256 of the installed client JSON (OAuth) or service-account JSON
+    (DWD); "" when it is not installed. token.json is deliberately not part of
+    it: the monitor refreshes and rewrites that file itself."""
+    path = SERVICE_ACCOUNT_PATH if normalize_auth_mode(auth_mode) == AUTH_DWD else CREDENTIALS_PATH
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError:
+        return ""
+    return digest.hexdigest()
 
 
 def copy_credentials(source_path):

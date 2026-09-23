@@ -23,6 +23,7 @@ from googleapiclient.errors import HttpError
 from app_settings import (
     AUTH_DWD,
     BASE_DIR,
+    credential_file_digest,
     get_account_configs,
     is_configured,
     load_allowed_extensions,
@@ -31,9 +32,17 @@ from app_settings import (
     normalize_auth_mode,
 )
 from filename_rules import filename_budget, render_filename
-from gmail_auth import AuthenticationRequiredError, get_gmail_service
+from gmail_auth import AccountNotConfiguredError, AuthenticationRequiredError, get_gmail_service
 from job_queue import JobQueue
-from runtime_state import SingleInstance, append_log, atomic_write_json, write_heartbeat
+from runtime_state import (
+    SingleInstance,
+    append_log,
+    atomic_write_json,
+    clear_auth_issue,
+    identity_key,
+    set_auth_issue,
+    write_heartbeat,
+)
 
 STATE_DIR = os.path.join(BASE_DIR, "state")
 QUEUE_DB = os.path.join(STATE_DIR, "jobs.sqlite3")
@@ -351,25 +360,85 @@ def scan_gmail(queue, service, account_email=None, final_dir=None, auth_mode=Non
     return {"account": account_email, "messages": message_count, "attachments": attachment_count}
 
 
+def verify_mailbox_identity(queue, account_email, service):
+    """Check the mailbox a service really opens against the identity stored for
+    the account (see runtime_state.IDENTITY_KEY_PREFIX), not against the typed
+    address, so an alias typed in the settings keeps working. Raises
+    AuthenticationRequiredError, so the caller defers instead of advancing a
+    cursor or saving into the account's folder."""
+    account_id = _account_id(account_email)
+    profile = service.users().getProfile(userId="me").execute(num_retries=3)
+    actual = _account_id((profile or {}).get("emailAddress") if isinstance(profile, dict) else "")
+    if not actual:
+        raise AuthenticationRequiredError(
+            f"Gmailが認証したメールボックスのアドレスを返さなかったため、取得を止めています（{account_id}）。"
+        )
+    key = identity_key(account_id)
+    stored = queue.get_metadata(key)
+    if stored is None:
+        # Installed before identities were recorded: trust on first use.
+        queue.set_metadata(key, actual)
+        log(f"Recorded mailbox identity on first use [{account_id}]: {actual}", "auth")
+        return actual
+    stored = _account_id(stored)
+    if not stored:
+        raise AuthenticationRequiredError(
+            f"{account_id} は接続テストで確認されていないため、取得を保留しています。"
+            "設定画面で接続テストを実行してから保存してください。"
+        )
+    if stored != actual:
+        raise AuthenticationRequiredError(
+            f"{account_id} で確認済みのメールボックス（{stored}）と、"
+            f"認証されたメールボックス（{actual}）が異なるため、取得を止めています。"
+            "設定画面で接続テストを実行し直してから保存してください。"
+        )
+    return actual
+
+
 class ServicePool:
-    def __init__(self, auth_mode=None, allow_interactive=False):
-        self.auth_mode = normalize_auth_mode(auth_mode or load_settings().get("auth_mode"))
+    """Gmail services per account. Every get() re-reads the settings: the pool
+    drops its services when the auth mode or the installed credential file
+    (SHA-256) changed since they were built, refuses accounts that are no
+    longer configured, and uses a newly built service only after
+    verify_mailbox_identity accepted it."""
+
+    def __init__(self, queue, allow_interactive=False):
+        self.queue = queue
         self.allow_interactive = allow_interactive
+        self.auth_mode = None
+        self._fingerprint = None
         self._services = {}
 
+    def _sync(self, settings):
+        mode = normalize_auth_mode(settings.get("auth_mode"))
+        fingerprint = (mode, credential_file_digest(mode))
+        if fingerprint != self._fingerprint:
+            if self._services:
+                log(f"Authentication settings changed (mode={mode}); rebuilding Gmail services", "auth")
+            self._services.clear()
+            self._fingerprint = fingerprint
+            self.auth_mode = mode
+        return mode
+
     def get(self, account_email):
-        key = _account_id(account_email) if self.auth_mode == AUTH_DWD else "oauth"
-        if key not in self._services:
-            self._services[key] = get_gmail_service(
-                account_email=account_email,
+        settings = load_settings()
+        mode = self._sync(settings)
+        account_id = _account_id(account_email)
+        if account_id not in {account["email"] for account in get_account_configs(settings)}:
+            raise AccountNotConfiguredError(f"このアカウントは現在の設定に含まれていません: {account_id or '(空欄)'}")
+        service = self._services.get(account_id)
+        if service is None:
+            service = get_gmail_service(
+                account_email=account_id,
                 allow_interactive=self.allow_interactive,
-                auth_mode=self.auth_mode,
+                auth_mode=mode,
             )
-        return self._services[key]
+            verify_mailbox_identity(self.queue, account_id, service)
+            self._services[account_id] = service
+        return service
 
     def invalidate(self, account_email):
-        key = _account_id(account_email) if self.auth_mode == AUTH_DWD else "oauth"
-        self._services.pop(key, None)
+        self._services.pop(_account_id(account_email), None)
 
 
 def scan_all_accounts(queue, pool=None):
@@ -378,7 +447,7 @@ def scan_all_accounts(queue, pool=None):
     accounts = get_account_configs(settings)
     if not accounts:
         raise RuntimeError("No Gmail account is configured.")
-    pool = pool or ServicePool(mode)
+    pool = pool or ServicePool(queue)
     results, errors = [], []
     for account in accounts:
         email = account["email"]
@@ -657,17 +726,26 @@ def _write_failure_notice(job, error):
 
 
 def process_one_job(queue, pool):
+    """The monitor's worker path. Besides the job itself it keeps the tray's
+    authentication issues current (runtime_state.AUTH_ISSUES_KEY); the trial
+    calls run_claimed_job directly and leaves them alone."""
     job = queue.claim_next()
     if job is None:
         return False
-    run_claimed_job(queue, pool, job)
+    outcome, detail = run_claimed_job(queue, pool, job)
+    account_email = _account_id((job.get("payload") or {}).get("account_email"))
+    if outcome == "deferred":
+        set_auth_issue(queue, account_email, detail)
+    elif outcome == "success":
+        clear_auth_issue(queue, account_email)
     return True
 
 
 def run_claimed_job(queue, pool, job):
     """Save one claimed job and record the outcome through the normal
     success/failure path. Returns (outcome, detail): ("success", result),
-    ("deferred", error) for authentication, or (mark_failure's disposition,
+    ("deferred", error) for authentication, ("failed", error) at once for an
+    account that is no longer configured, or (mark_failure's disposition,
     error)."""
     payload = job.get("payload") or {}
     account_email = _account_id(payload.get("account_email"))
@@ -686,6 +764,13 @@ def run_claimed_job(queue, pool, job):
         log(f"Attachment job {job['id']} succeeded [{account_email}]", "worker")
         return "success", result
     except Exception as exc:
+        if isinstance(exc, AccountNotConfiguredError):
+            # Deferring would retry every 15 minutes forever; fail it visibly
+            # instead (the failed list can retry it once the account is back).
+            # No notice file: the account's old folder may be gone for good.
+            queue.fail_job(job["id"], exc)
+            log(f"Attachment job {job['id']} failed: account not configured [{account_email}]", "worker")
+            return "failed", exc
         if _is_auth_error(exc):
             pool.invalidate(account_email)
             queue.defer_job(job["id"], exc, AUTH_DEFER_SECONDS)
@@ -699,7 +784,7 @@ def run_claimed_job(queue, pool, job):
 
 
 def process_jobs(queue, pool=None, limit=MAX_JOBS_PER_ONCE):
-    pool = pool or ServicePool(load_settings().get("auth_mode"))
+    pool = pool or ServicePool(queue)
     processed = 0
     while processed < limit and process_one_job(queue, pool):
         processed += 1
@@ -718,7 +803,7 @@ def worker_loop(queue, stop_event):
     and set only when this function is about to exit.
     """
     try:
-        pool = ServicePool(load_settings().get("auth_mode"))
+        pool = ServicePool(queue)
         queue.delete_metadata(WORKER_ERROR_KEY)
         last_beat = 0.0
         while not stop_event.is_set():
@@ -759,9 +844,8 @@ def maybe_apply_retention(queue, force=False):
 
 def run_once(queue=None):
     queue = queue or JobQueue(QUEUE_DB)
-    settings = load_settings()
-    scan = scan_all_accounts(queue, ServicePool(settings.get("auth_mode")))
-    jobs = process_jobs(queue, ServicePool(settings.get("auth_mode")))
+    scan = scan_all_accounts(queue, ServicePool(queue))
+    jobs = process_jobs(queue, ServicePool(queue))
     maybe_apply_retention(queue)
     return {"scan": scan, "processed_jobs": jobs, "queue": queue.counts()}
 
@@ -769,7 +853,7 @@ def run_once(queue=None):
 def test_recent_emails(max_results):
     settings = load_settings()
     mode = normalize_auth_mode(settings.get("auth_mode"))
-    pool = ServicePool(mode)
+    pool = ServicePool(JobQueue(QUEUE_DB))
     excluded_labels = load_excluded_labels(settings)
     results = []
     for account in get_account_configs(settings):
@@ -790,7 +874,9 @@ def test_recent_emails(max_results):
 # cursors and write LAST_ERROR_KEY: the trial writes no cursor, pause,
 # LAST_ERROR or WORKER_* metadata, and a job failure is recorded only on the
 # job by the normal job path. It reuses iter_message_ids and run_claimed_job
-# as they are, so heartbeat.json and mail_log.txt are written as usual.
+# as they are, so heartbeat.json and mail_log.txt are written as usual. Like
+# the monitor, its ServicePool records a mailbox identity on first use for an
+# install from before identities were recorded.
 
 TRIAL_TRAY_RUNNING_TEXT = (
     "自動取得（トレイアプリまたは監視プロセス）が動作中です。トレイアプリを終了してから実行してください。\n"
@@ -892,7 +978,7 @@ def run_trial_job(queue, pool, job_key):
 def run_trial(queue, count=TRIAL_DEFAULT_MESSAGES, pool=None, scan_cap=TRIAL_SCAN_CAP):
     settings = load_settings()
     mode = normalize_auth_mode(settings.get("auth_mode"))
-    pool = pool or ServicePool(mode)
+    pool = pool or ServicePool(queue)
     excluded_labels = load_excluded_labels(settings)
     allowed_extensions = load_allowed_extensions(settings)
     reports = []
@@ -991,11 +1077,11 @@ def _trial_auth_hint(mode):
         return (
             "Gmailの認証またはAPIアクセスに失敗しました。Google Cloud プロジェクトで Gmail API が有効か、"
             "Google管理コンソールでドメイン全体の委任（gmail.readonly）が承認されているかを確認し、"
-            "設定画面の「登録した全アカウントに接続してテスト」で確かめてください。"
+            "設定画面の「登録した全アカウントに接続してテスト」で確かめてから「保存」してください。"
         )
     return (
         "Gmailの認証またはAPIアクセスに失敗しました。Google Cloud プロジェクトで Gmail API が有効かを確認し、"
-        "設定画面の「Googleに接続してテスト」で認証を済ませてから、もう一度実行してください。"
+        "設定画面の「Googleに接続してテスト」で認証を済ませて「保存」してから、もう一度実行してください。"
     )
 
 
@@ -1214,7 +1300,7 @@ def main():
             name="attachment-worker",
         )
         worker.start()
-        scan_pool = ServicePool(settings.get("auth_mode"))
+        scan_pool = ServicePool(queue)
         while not stop_event.is_set():
             try:
                 scan_all_accounts(queue, scan_pool)

@@ -146,6 +146,7 @@ class WatchdogOwnershipTest(unittest.TestCase):
     def test_restart_aborts_when_stop_identity_is_unknown(self):
         state = {"restart_times": [], "stale_count": 3}
         with mock.patch.object(watchdog, "is_paused", return_value=False), \
+             mock.patch.object(watchdog, "is_settings_update", return_value=False), \
              mock.patch.object(watchdog, "stop_monitor", return_value=False), \
              mock.patch.object(watchdog, "start_monitor") as start, \
              mock.patch.object(watchdog, "log_event"), \
