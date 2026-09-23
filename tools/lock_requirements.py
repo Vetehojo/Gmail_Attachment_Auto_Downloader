@@ -133,9 +133,12 @@ def _compare(left, op, right, variable):
         left, right = canonical_name(left), canonical_name(right)
     if op == "===":
         return left == right
-    if op in ("==", "!=") and right.endswith(".*") and _release(left) and _release(right[:-2]):
-        prefix = _release(right[:-2])
-        return (_release(left)[:len(prefix)] == prefix) == (op == "==")
+    if op in ("==", "!=") and right.endswith(".*"):
+        prefix, candidate = _release(right[:-2]), _release(left)
+        if prefix is None or candidate is None:
+            raise ValueError(f"cannot compare {left!r} {op} {right!r} as versions")
+        candidate += (0,) * (len(prefix) - len(candidate))  # "2" is 2.0, so it is in 2.0.*
+        return (candidate[:len(prefix)] == prefix) == (op == "==")
     a, b = _release(left), _release(right)
     if a is None or b is None:
         if op in ("==", "!="):

@@ -9,9 +9,9 @@
 | パッケージ | ライセンス | 配布元 |
 | --- | --- | --- |
 | google-api-python-client | Apache License 2.0 | https://github.com/googleapis/google-api-python-client |
-| google-auth | Apache License 2.0 | https://github.com/googleapis/google-auth-library-python |
-| google-auth-httplib2 | Apache License 2.0 | https://github.com/googleapis/google-auth-library-python-httplib2 |
-| google-auth-oauthlib | Apache License 2.0 | https://github.com/googleapis/google-auth-library-python-oauthlib |
+| google-auth | Apache License 2.0 | https://pypi.org/project/google-auth/ |
+| google-auth-httplib2 | Apache License 2.0 | https://pypi.org/project/google-auth-httplib2/ |
+| google-auth-oauthlib | Apache License 2.0 | https://pypi.org/project/google-auth-oauthlib/ |
 | httplib2（google-auth-httplib2 の依存） | MIT License | https://github.com/httplib2/httplib2 |
 | six（pystray の依存） | MIT License | https://github.com/benjaminp/six |
 | certifi（requests の依存） | Mozilla Public License 2.0 | https://github.com/certifi/python-certifi |

@@ -135,6 +135,26 @@ class ParseTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             satisfies("2.0.0rc1", ((">=", "1"),))
 
+    def test_prefix_ranges_pad_the_version_with_zeros(self):
+        satisfies = lock_requirements.satisfies
+        for version, spec, expected in (
+            ("2", "!=2.0.*", False), ("2", "==2.0.*", True), ("2", "==2.0.0.*", True),
+            ("2.0", "!=2.0.*", False), ("2.1", "!=2.0.*", True), ("2.1", "==2.0.*", False),
+            ("2", "==2.*", True), ("20", "==2.*", False), ("3", "!=2.0.*", True),
+        ):
+            with self.subTest(version=version, spec=spec):
+                self.assertIs(expected, satisfies(version, lock_requirements.parse_requirement("x" + spec)[2]))
+        self.assertIs(True, evaluate('python_version == "3.14.*"'))
+        self.assertIs(False, evaluate('python_version != "3.14.0.*"'))
+
+    def test_prefix_ranges_refuse_versions_they_cannot_order(self):
+        for version, spec in (("2.0rc1", "!=2.0.*"), ("2.0rc1", "==2.0.*"), ("2.0", "==2.x.*")):
+            with self.subTest(version=version, spec=spec):
+                with self.assertRaisesRegex(ValueError, "cannot compare"):
+                    lock_requirements.satisfies(version, lock_requirements.parse_requirement("x" + spec)[2])
+        with self.assertRaisesRegex(ValueError, "cannot compare"):
+            evaluate('platform_system == "Windows.*"')
+
     def test_requirements_file(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "requirements.txt")
