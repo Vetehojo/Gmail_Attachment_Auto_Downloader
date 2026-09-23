@@ -105,7 +105,7 @@ def iter_message_ids(service, query, account_email=""):
         page_token = result.get("nextPageToken")
         if not page_token:
             break
-        write_heartbeat(HEARTBEAT_FILE, "ok", f"gmail pagination: {account_email}")
+        write_heartbeat(HEARTBEAT_FILE, "ok", f"gmail pagination: {account_email}", log_path=LOG_FILE)
 
 
 def _header(headers, name, default=""):
@@ -183,7 +183,11 @@ def get_attachments_from_payload(payload):
                 })
             visit(part.get("parts", []))
 
-    visit((payload or {}).get("parts", []))
+    # Start at the payload itself: a single-part message (e.g. a bare PDF)
+    # carries its filename and attachmentId/data on the top-level payload
+    # (partId ""). A multipart top level has no filename, so it adds nothing
+    # and its children produce exactly the jobs they did before.
+    visit([payload] if payload else [])
     return attachments, inline_image_skips
 
 
@@ -286,14 +290,16 @@ def scan_gmail(queue, service, account_email=None, final_dir=None, auth_mode=Non
 
     message_count = 0
     attachment_count = 0
-    write_heartbeat(HEARTBEAT_FILE, "ok", f"gmail scan: {account_email}")
+    write_heartbeat(HEARTBEAT_FILE, "ok", f"gmail scan: {account_email}", log_path=LOG_FILE)
     for message_id in iter_message_ids(service, query, account_email):
         attachment_count += enqueue_message_jobs(
             queue, service, message_id, account_email, final_dir, allowed_extensions=allowed_extensions
         )
         message_count += 1
         if message_count % 10 == 0:
-            write_heartbeat(HEARTBEAT_FILE, "ok", f"gmail scan {account_email}: {message_count} messages")
+            write_heartbeat(
+                HEARTBEAT_FILE, "ok", f"gmail scan {account_email}: {message_count} messages", log_path=LOG_FILE
+            )
 
     # Advance only after pagination and all enqueue operations complete.
     queue.set_metadata(cursor_key(account_email, mode), scan_started.timestamp())
@@ -344,10 +350,10 @@ def scan_all_accounts(queue, pool=None):
             log(f"Gmail scan failed [{email}]: {exc}", "scan")
     if errors:
         queue.set_metadata(LAST_ERROR_KEY, " / ".join(f"{e['account']}: {e['error']}" for e in errors)[:4000])
-        write_heartbeat(HEARTBEAT_FILE, "error", f"gmail scan failed: {errors[0]['account']}")
+        write_heartbeat(HEARTBEAT_FILE, "error", f"gmail scan failed: {errors[0]['account']}", log_path=LOG_FILE)
     else:
         queue.delete_metadata(LAST_ERROR_KEY)
-        write_heartbeat(HEARTBEAT_FILE, "ok", "gmail scan complete")
+        write_heartbeat(HEARTBEAT_FILE, "ok", "gmail scan complete", log_path=LOG_FILE)
     return {"accounts": results, "errors": errors}
 
 
@@ -441,6 +447,10 @@ def _attachment_marker_path(job_id):
 
 
 def _find_part_by_id(payload, part_id):
+    # Gmail gives the top-level payload partId "" (single-part messages).
+    if payload and str(payload.get("partId", "")) == part_id:
+        return payload
+
     def visit(parts):
         for part in parts or []:
             if str(part.get("partId", "")) == part_id:
@@ -464,8 +474,9 @@ def _attachment_bytes(service, payload):
         ).execute(num_retries=3)
         return base64.urlsafe_b64decode(attachment["data"])
 
-    part_id = payload.get("part_id", "")
-    if not part_id:
+    # "" is a valid part_id: the top-level payload of a single-part message.
+    part_id = payload.get("part_id")
+    if part_id is None:
         raise RuntimeError("Gmail attachment job has neither attachment_id nor part_id.")
     message = service.users().messages().get(
         userId="me", id=payload["message_id"], format="full"
@@ -477,6 +488,17 @@ def _attachment_bytes(service, payload):
     if not inline_data:
         raise RuntimeError(f"Attachment part {part_id} in message {payload['message_id']} has no inline data.")
     return base64.urlsafe_b64decode(inline_data)
+
+
+def _fresh_target_path(payload, final_dir):
+    filename = render_filename(
+        payload["filename"],
+        payload.get("received_date", ""),
+        payload.get("sender_email", ""),
+        payload.get("mail_subject", ""),
+        max_filename_length=filename_budget(final_dir),
+    )
+    return _unique_path(os.path.join(final_dir, filename))
 
 
 def run_attachment_job(job_id, service, payload):
@@ -496,15 +518,9 @@ def run_attachment_job(job_id, service, payload):
         target_path = os.path.abspath(result.get("target_path", ""))
         if not target_path:
             raise RuntimeError("添付ファイルcommit journalが不正です。")
+        prepared = marker.get("phase") == "prepared" and marker.get("success") is False
     else:
-        filename = render_filename(
-            payload["filename"],
-            payload.get("received_date", ""),
-            payload.get("sender_email", ""),
-            payload.get("mail_subject", ""),
-            max_filename_length=filename_budget(final_dir),
-        )
-        target_path = _unique_path(os.path.join(final_dir, filename))
+        target_path = _fresh_target_path(payload, final_dir)
         result = {
             "hash": file_hash,
             "filename": payload["filename"],
@@ -514,12 +530,22 @@ def run_attachment_job(job_id, service, payload):
             "final_dir": final_dir,
         }
         atomic_write_json(marker_path, {"success": False, "phase": "prepared", "result": result})
+        prepared = True
 
     if _file_matches(target_path, file_hash):
         atomic_write_json(marker_path, {"success": True, "phase": "committed", "result": result})
         return result
     if os.path.exists(target_path):
-        raise RuntimeError(f"保存予定先に別内容のファイルが存在します: {target_path}")
+        # A save interrupted after "prepared" never wrote the pinned name, so
+        # another job may have taken it since. Only when _file_matches really
+        # hashed that file (a read error propagates and the job retries) move
+        # to a fresh name from the rendered base -- not name(1)(1) -- and
+        # persist it before writing. Committed or legacy journals still stop.
+        if not (prepared and os.path.isfile(target_path)):
+            raise RuntimeError(f"保存予定先に別内容のファイルが存在します: {target_path}")
+        target_path = _fresh_target_path(payload, final_dir)
+        result = dict(result, saved_filename=os.path.basename(target_path), target_path=target_path)
+        atomic_write_json(marker_path, {"success": False, "phase": "prepared", "result": result})
 
     _write_bytes_atomic(file_data, target_path, job_id)
     if not _file_matches(target_path, file_hash):
@@ -596,8 +622,10 @@ def process_one_job(queue, pool):
         return False
     payload = job.get("payload") or {}
     account_email = _account_id(payload.get("account_email"))
-    write_heartbeat(HEARTBEAT_FILE, "ok", f"attachment job {job['id']}: {account_email}")
     try:
+        # Inside the try: whatever a heartbeat write raises must still release
+        # the claimed job through mark_failure instead of leaving it processing.
+        write_heartbeat(HEARTBEAT_FILE, "ok", f"attachment job {job['id']}: {account_email}", log_path=LOG_FILE)
         service = pool.get(account_email)
         result = run_attachment_job(job["id"], service, payload)
         if not queue.mark_success(job["id"], result):
@@ -771,7 +799,7 @@ def main():
             except Exception as exc:
                 queue.set_metadata(LAST_ERROR_KEY, str(exc)[:4000])
                 log(f"Gmail scan cycle failed: {exc}", "scan")
-                write_heartbeat(HEARTBEAT_FILE, "error", f"gmail scan cycle failed: {exc}")
+                write_heartbeat(HEARTBEAT_FILE, "error", f"gmail scan cycle failed: {exc}", log_path=LOG_FILE)
             maybe_apply_retention(queue)
             stop_event.wait(polling_interval)
     except KeyboardInterrupt:

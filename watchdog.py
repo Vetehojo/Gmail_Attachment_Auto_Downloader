@@ -37,6 +37,12 @@ def log_event(message):
     append_log(WATCHDOG_LOG, message)
 
 
+def _run_hidden(command, **kwargs):
+    # The watchdog runs under pythonw; hide console children. Never use
+    # DETACHED_PROCESS: PowerShell needs a (hidden) console for stdout.
+    return subprocess.run(command, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **kwargs)
+
+
 def _write_customer_notice(message):
     """Fallback for machines without msg.exe (Windows Home): leave a file the
     customer will actually see in every configured save folder, matching the
@@ -64,7 +70,7 @@ def _write_customer_notice(message):
 
 def notify(message, customer_alert=False):
     try:
-        subprocess.run(["msg", os.environ.get("USERNAME", "*"), message], capture_output=True, timeout=10)
+        _run_hidden(["msg", os.environ.get("USERNAME", "*"), message], capture_output=True, timeout=10)
     except Exception:
         pass
     if customer_alert:
@@ -73,7 +79,7 @@ def notify(message, customer_alert=False):
 
 def event_log(message):
     try:
-        subprocess.run(
+        _run_hidden(
             ["eventcreate", "/T", "ERROR", "/ID", "100", "/L", "APPLICATION",
              "/SO", "GmailAutoDownloader", "/D", message[:300]],
             capture_output=True, timeout=10,
@@ -108,7 +114,7 @@ def is_paused():
 
 
 def powershell(script):
-    result = subprocess.run(
+    result = _run_hidden(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
         capture_output=True, text=True, timeout=20,
     )

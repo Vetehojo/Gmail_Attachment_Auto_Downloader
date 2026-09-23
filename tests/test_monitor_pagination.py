@@ -279,6 +279,45 @@ class MonitorPaginationTest(unittest.TestCase):
         self.assertEqual("2.0", attachments[1]["part_id"])
         self.assertEqual(0, inline_image_skips)
 
+    def test_get_attachments_from_payload_reads_a_single_part_top_level(self):
+        # F6: a single-part message keeps filename + attachmentId/data on the
+        # top-level payload, whose partId is "".
+        by_id = {
+            "partId": "",
+            "mimeType": "application/pdf",
+            "filename": "scan.pdf",
+            "body": {"attachmentId": "att-top", "size": 2048},
+        }
+        text_body = {"data": "aGVsbG8=", "size": 5}
+        inline = {"partId": "", "mimeType": "text/plain", "filename": "memo.txt", "body": text_body}
+        plain_body = {"partId": "", "mimeType": "text/plain", "filename": "", "body": text_body}
+
+        attachments, _skips = gmail_monitor.get_attachments_from_payload(by_id)
+        self.assertEqual([("scan.pdf", "att-top", "", "")], [
+            (a["filename"], a["attachment_id"], a["inline_data"], a["part_id"]) for a in attachments
+        ])
+        attachments, _skips = gmail_monitor.get_attachments_from_payload(inline)
+        self.assertEqual([("memo.txt", "", "aGVsbG8=", "")], [
+            (a["filename"], a["attachment_id"], a["inline_data"], a["part_id"]) for a in attachments
+        ])
+        # A plain text body with no filename is still not an attachment.
+        self.assertEqual(([], 0), gmail_monitor.get_attachments_from_payload(plain_body))
+        self.assertEqual(([], 0), gmail_monitor.get_attachments_from_payload({}))
+
+    def test_find_part_by_id_matches_the_top_level_then_children(self):
+        nested = {"partId": "2.0", "filename": "memo.txt", "body": {"data": "aGVsbG8="}}
+        first = {"partId": "1", "filename": "report.pdf", "body": {"attachmentId": "att-1"}}
+        child = {"partId": "2", "filename": "", "body": {}, "parts": [nested]}
+        payload = {"partId": "", "filename": "", "body": {"size": 0}, "parts": [first, child]}
+
+        self.assertIs(payload, gmail_monitor._find_part_by_id(payload, ""))
+        self.assertIs(first, gmail_monitor._find_part_by_id(payload, "1"))
+        self.assertIs(child, gmail_monitor._find_part_by_id(payload, "2"))
+        self.assertIs(nested, gmail_monitor._find_part_by_id(payload, "2.0"))
+        self.assertIsNone(gmail_monitor._find_part_by_id(payload, "9"))
+        # A payload without a partId key still resolves its children as before.
+        self.assertIs(first, gmail_monitor._find_part_by_id({"parts": [first]}, "1"))
+
     def test_get_attachments_from_payload_skips_inline_signature_logo(self):
         payload = {
             "parts": [
@@ -544,6 +583,53 @@ class EnqueueMessageJobsTest(unittest.TestCase):
 
         self.assertTrue(any("data.csv" in line and "extension .csv is not allowed" in line for line in logged))
         self.assertTrue(any("Skipped 1 inline image part" in line for line in logged))
+
+    def test_multipart_job_keys_are_unchanged_by_top_level_scanning(self):
+        # F6/I4: these keys were computed with the pre-F6 code, which never
+        # looked at the top-level payload. A changed key would re-download
+        # attachments that are already saved.
+        message_payload = {
+            "partId": "",
+            "mimeType": "multipart/mixed",
+            "filename": "",
+            "headers": [
+                {"name": "subject", "value": "件名"},
+                {"name": "from", "value": "sender@example.com"},
+                {"name": "date", "value": "Tue, 25 Aug 2026 00:00:00 +0900"},
+                {"name": "Content-Type", "value": "multipart/mixed; boundary=b1"},
+            ],
+            "body": {"size": 0},
+            "parts": [
+                {"partId": "0", "mimeType": "text/plain", "filename": "", "body": {"size": 12}},
+                {"partId": "1", "filename": "report.pdf", "body": {"attachmentId": "att-1", "size": 2048}},
+                {
+                    "partId": "2",
+                    "mimeType": "multipart/mixed",
+                    "filename": "",
+                    "body": {},
+                    "parts": [
+                        {"partId": "2.0", "filename": "memo.txt", "body": {"data": "aGVsbG8=", "size": 5}},
+                    ],
+                },
+            ],
+        }
+        queue = FakeQueue()
+        with mock.patch.object(gmail_monitor, "load_settings", return_value=oauth_settings()), \
+             mock.patch.object(gmail_monitor, "log", lambda *a, **k: None):
+            added = gmail_monitor.enqueue_message_jobs(
+                queue, FakeMessageService(message_payload), "m1", "a@example.com", tempfile.gettempdir(),
+                allowed_extensions={".pdf", ".txt"},
+            )
+
+        self.assertEqual(2, added)
+        self.assertEqual(
+            [
+                "attachment:a@example.com:m1:fb6d26e9d81218fafbcbe562680cfc2ed4e2b2b6fae879e8a445ea5d4d23da9f",
+                "attachment:a@example.com:m1:799835831bee5f935190f4310495279fc917bb5b0a8e1947b9c44f8429a37366",
+            ],
+            [key for key, _payload in queue.enqueued],
+        )
+        self.assertEqual(["1", "2.0"], [payload["part_id"] for _key, payload in queue.enqueued])
 
 
 class OrphanTempCleanupTest(unittest.TestCase):

@@ -24,9 +24,9 @@ if errorlevel 1 (
     python --version
     goto :END_ERROR
 )
-for /f "usebackq delims=" %%p in (`python -c "import os,sys; print(os.path.join(os.path.dirname(sys.executable),'pythonw.exe'))"`) do set "PYTHONW=%%p"
-if not defined PYTHONW goto :END_ERROR
-if not exist "%PYTHONW%" goto :END_ERROR
+for /f "usebackq delims=" %%p in (`python -X utf8 -c "import os,sys; print(os.path.join(os.path.dirname(sys.executable),'pythonw.exe'))"`) do set "PYTHONW=%%p"
+if not defined PYTHONW goto :PYTHONW_ERROR
+if not exist "%PYTHONW%" goto :PYTHONW_ERROR
 
 echo [2/3] Installing Python packages...
 pushd "%SDIR%"
@@ -55,6 +55,12 @@ echo Setup complete. Tray app started.
 echo Register automatic startup with register_logon_task.bat when ready.
 echo.
 goto :END_OK
+
+:PYTHONW_ERROR
+echo.
+echo [ERROR] pythonw.exe was not found next to the python.exe on PATH.
+echo [ERROR] PYTHONW value: "%PYTHONW%"
+goto :END_ERROR
 
 :END_ERROR
 echo.

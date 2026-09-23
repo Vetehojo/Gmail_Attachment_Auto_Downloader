@@ -37,9 +37,27 @@ class ProcessQuery:
     rows: list[dict[str, str]]
 
 
+def _has_console() -> bool:
+    if os.name != "nt":
+        return True
+    import ctypes
+
+    return ctypes.windll.kernel32.GetConsoleCP() != 0
+
+
+def _creation_flags() -> int:
+    # pythonw hosts have no console, so each console child would open a window.
+    # Never use DETACHED_PROCESS: PowerShell needs a (hidden) console for stdout.
+    if _has_console():
+        return 0
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 class Runner:
     def run(self, command: list[str]) -> CommandResult:
-        completed = subprocess.run(command, capture_output=True, check=False)
+        completed = subprocess.run(
+            command, capture_output=True, check=False, creationflags=_creation_flags()
+        )
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
 

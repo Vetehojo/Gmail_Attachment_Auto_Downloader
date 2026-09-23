@@ -29,16 +29,23 @@ from app_settings import (
 )
 from filename_rules import preview_filename, validate_template
 from job_queue import JobQueue
-from runtime_state import SingleInstance, read_heartbeat
+from runtime_state import SingleInstance, append_log, read_heartbeat
 import windows_integration
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 QUEUE_DB = os.path.join(STATE_DIR, "jobs.sqlite3")
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
 APP_LOCK_FILE = os.path.join(STATE_DIR, "app.lock")
+TRAY_LOG = os.path.join(SCRIPT_DIR, "log", "tray_log.txt")
 MONITOR_SCRIPT = os.path.join(SCRIPT_DIR, "gmail_monitor.py")
 MAIL_CURSOR_KEY = "mail_cursor_timestamp"
 PAUSED_KEY = "monitor_paused"
+# Why the monitor is paused: "exit" (set by exit_app) is cleared automatically
+# on the next start, "user" (set by toggle_pause) survives restarts/logon (I6).
+# A missing reason (older versions, or a pause set before this key existed) is
+# treated the same as "user" - stay paused rather than guess it was exit-only.
+PAUSE_REASON_KEY = "monitor_pause_reason"
+PAUSE_STARTUP_NOTICE = "自動取得は一時停止中です。トレイメニューの「一時停止 / 再開」で再開できます。"
 LAST_ERROR_KEY = "monitor_last_error"
 # Keys written by gmail_monitor's worker thread (see C3 in PR32 contract).
 # Redefined here rather than imported so the tray process never has to pull
@@ -54,6 +61,10 @@ def queue():
     if _QUEUE_INSTANCE is None:
         _QUEUE_INSTANCE = JobQueue(QUEUE_DB)
     return _QUEUE_INSTANCE
+
+
+def log(message, procedure="tray"):
+    append_log(TRAY_LOG, message, procedure)
 
 
 def format_time(value):
@@ -705,6 +716,7 @@ class TrayApp:
         self.last_failed_count = -1
         self.last_monitor_error = ""
         self.last_worker_issue = ""
+        self._startup_notice = ""
         self.instance = SingleInstance("Local\\GmailAutoDownloaderTray", APP_LOCK_FILE)
 
     def start(self):
@@ -717,10 +729,7 @@ class TrayApp:
                 SettingsDialog(self, initial=not is_configured(), setup_only=True)
                 self.root.mainloop()
                 return 0
-            if not is_configured():
-                SettingsDialog(self, initial=True)
-            elif not self.paused():
-                self.controller.start()
+            self._prepare_startup()
             self._start_tray()
             self.root.after(3000, self._health_tick)
             self.root.mainloop()
@@ -730,6 +739,28 @@ class TrayApp:
 
     def paused(self):
         return queue().get_metadata(PAUSED_KEY, "0") == "1"
+
+    def _prepare_startup(self):
+        """Resolve pause state and start the monitor if applicable, before the
+        tray icon is created (I6). Split out from start() so it can run
+        without opening a real tray icon or entering the Tk mainloop.
+        """
+        self._resume_from_exit_pause()
+        configured = is_configured()
+        if not configured:
+            SettingsDialog(self, initial=True)
+        elif not self.paused():
+            self.controller.start()
+        self._startup_notice = PAUSE_STARTUP_NOTICE if configured and self.paused() else ""
+
+    def _resume_from_exit_pause(self):
+        """Clear a pause the tray itself set on exit; a user's own (or legacy,
+        reason-less) pause must survive a restart/logon instead (I6).
+        """
+        q = queue()
+        if q.get_metadata(PAUSED_KEY, "0") == "1" and q.get_metadata(PAUSE_REASON_KEY, "") == "exit":
+            q.delete_metadata(PAUSE_REASON_KEY)
+            q.set_metadata(PAUSED_KEY, "0")
 
     def apply_scan_start(self, start):
         now = datetime.now()
@@ -796,7 +827,20 @@ class TrayApp:
                 pystray.MenuItem("終了（自動取得を停止）", call(self.exit_app)),
             ),
         )
-        self.tray.run_detached()
+        # run_detached() returns as soon as the backend thread is scheduled,
+        # before the icon is actually live; notifying right after that call
+        # can race the platform backend and be silently dropped. pystray's own
+        # setup callback is guaranteed to run once the icon is live, so the
+        # startup pause notice is sent from there instead.
+        self.tray.run_detached(setup=self._on_tray_ready)
+
+    def _on_tray_ready(self, icon):
+        icon.visible = True
+        if self._startup_notice:
+            try:
+                icon.notify(self._startup_notice, "Gmail Attachment Downloader")
+            except Exception as exc:
+                log(f"startup notification failed: {exc}", "tray")
 
     def _worker_issue(self, counts):
         """Reason string when the attachment worker thread looks dead/stalled, else "".
@@ -849,11 +893,25 @@ class TrayApp:
             worker_issue = "" if self.paused() else self._worker_issue(counts)
             has_error = counts["failed"] > 0 or bool(monitor_error) or bool(worker_issue)
             if self.tray is not None:
-                self.tray.icon = self.error_icon if has_error else self.normal_icon
-                self.tray.title = (
-                    f"Gmail Attachment Downloader - 失敗 {counts['failed']}件"
-                    if has_error else "Gmail Attachment Downloader"
-                )
+                if self.paused():
+                    # Every tick otherwise overwrites this with the plain title
+                    # below, which used to erase the only sign that a pause
+                    # (not a crash) is why nothing is being fetched. Existing
+                    # failed jobs are still real failures while paused, so the
+                    # error icon/count must not disappear just because the
+                    # pause also explains why nothing new is being fetched.
+                    if counts["failed"] > 0:
+                        self.tray.icon = self.error_icon
+                        self.tray.title = f"Gmail Attachment Downloader - 一時停止中 / 失敗 {counts['failed']}件"
+                    else:
+                        self.tray.icon = self.normal_icon
+                        self.tray.title = "Gmail Attachment Downloader - 一時停止中"
+                else:
+                    self.tray.icon = self.error_icon if has_error else self.normal_icon
+                    self.tray.title = (
+                        f"Gmail Attachment Downloader - 失敗 {counts['failed']}件"
+                        if has_error else "Gmail Attachment Downloader"
+                    )
                 if self.last_failed_count >= 0 and counts["failed"] > self.last_failed_count:
                     try:
                         self.tray.notify(f"添付ファイル取得失敗が {counts['failed']} 件あります。", "Gmail Attachment Downloader")
@@ -889,10 +947,16 @@ class TrayApp:
     def toggle_pause(self):
         q = queue()
         if self.paused():
+            # Clear the reason before the flag: if this is interrupted between
+            # the two writes, the flag stays "1" and the pause is kept (with no
+            # reason, i.e. treated like a user/legacy pause) rather than
+            # silently resuming.
+            q.delete_metadata(PAUSE_REASON_KEY)
             q.set_metadata(PAUSED_KEY, "0")
             self.controller.start()
             messagebox.showinfo("Gmail Attachment Downloader", "自動取得を再開しました。")
         else:
+            q.set_metadata(PAUSE_REASON_KEY, "user")
             q.set_metadata(PAUSED_KEY, "1")
             self.controller.stop_all()
             messagebox.showinfo("Gmail Attachment Downloader", "自動取得を一時停止しました。")
@@ -1259,7 +1323,13 @@ class TrayApp:
 
     def exit_app(self, stop_monitor=True):
         if stop_monitor:
-            queue().set_metadata(PAUSED_KEY, "1")
+            q = queue()
+            if not self.paused():
+                # Only a not-paused -> paused transition here is "exit" and
+                # gets auto-cleared on the next start; an already-paused
+                # instance (user pause) keeps its existing reason (I6).
+                q.set_metadata(PAUSE_REASON_KEY, "exit")
+                q.set_metadata(PAUSED_KEY, "1")
             self.controller.stop_all()
         if self.tray is not None:
             try:
