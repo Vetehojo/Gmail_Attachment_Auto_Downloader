@@ -312,8 +312,8 @@ worker
 `setup.bat` は、動作を確認した全依存パッケージの固定版を並べた `requirements.lock` を `python -m pip install -r requirements.lock` で入れる。
 
 - 仮想環境は使わず、PATH上のPython 3.14へ入れる。同じPythonを使うほかのプログラムがあると、共通のパッケージ（requests、urllib3、certifi、cryptography、protobuf、Pillowなど）の版が上がったり下がったりすることがある
-- このアプリが依存パッケージの版を変えるのは、新しい版のアプリを入れて `setup.bat` を実行したときだけ。ほかのプログラムが同じPythonにパッケージを入れると、このアプリが使う版も変わることがある（`setup.bat` を実行し直すと `requirements.lock` の版に戻る）
-- 新しい版で `setup.bat` を実行する前に、トレイメニューの「終了（自動取得を停止）」でトレイアプリを終了する
+- このアプリが依存パッケージの版を変えるのは、`setup.bat` を実行したとき（新しい版を入れたときや、実行し直したとき）だけ。ほかのプログラムが同じPythonにパッケージを入れると、このアプリが使う版も変わることがある。`setup.bat` を実行し直すと `requirements.lock` の版に戻る
+- どちらの場合も、`setup.bat` を実行する前にトレイメニューの「終了（自動取得を停止）」でトレイアプリを終了し、終わったら `register_logon_task.bat` を実行するか、サインアウトしてサインインし直す（下記「新しい版への更新」）
 - `requirements.txt` は `requirements.lock` を作り直すときの元の一覧（直接使うパッケージと許容範囲）で、導入には使わない
 
 `requirements.lock` の作り直し（保守する人向け。Windows / Python 3.14で、インストールフォルダーから実行する）:
@@ -325,15 +325,28 @@ worker
 
 入っている版が `requirements.txt` の範囲や依存元の要求範囲から外れていると、`tools\lock_requirements.py` は何も書かずにエラーで終了する。その場合は手順1からやり直す。
 
-## 旧フォルダー構成からの更新
+## 新しい版への更新
 
-Pythonファイルをフォルダー直下に置いていた版から更新した場合、登録済みのタスクは旧パスのスクリプトを指したままになる。`register_logon_task.bat` は自分の登録と一致しないタスクを書き換えずに停止するので、次の順で入れ替える。
+1. トレイメニューの「終了（自動取得を停止）」でトレイアプリを終了する
+2. 新しい版のファイルを、今のフォルダーに上書きで展開する。`config.ini`・`state\`・`log\` はそのまま使う
+3. `setup.bat` を実行する。依存パッケージを新しい版の `requirements.lock` に合わせたあと設定画面が開く。設定を変えないなら「キャンセル」で閉じてよい
+4. `register_logon_task.bat` を実行する。タスクを登録し直して、その場でトレイアプリを起動する。代わりにサインアウトしてサインインし直してもよい
+
+「終了」で止めた自動取得は、次にトレイアプリが起動するまで止まったままになる（一時停止中と同じ扱いで、watchdogも監視プロセスを起動しない）。`setup.bat` だけで終わらせず、手順4まで行う。
+
+### 旧フォルダー構成からの更新
+
+Pythonファイルをフォルダー直下に置いていた版から更新する場合、登録済みのタスクは旧パスのスクリプトを指したままになる。`register_logon_task.bat` は自分の登録と一致しないタスクを書き換えずに停止するので、次の順で入れ替える。
 
 1. トレイメニューの「終了（自動取得を停止）」でトレイアプリを終了する。旧トレイが動いたままだと、新しいトレイは多重起動防止により何もせず終了する
 2. タスクスケジューラで `Gmail Auto Downloader Monitor` と `Gmail Auto Downloader Watchdog` を削除する。旧構成のタスクは管理者として実行したウィンドウから登録されているため、削除を拒否されたときは、タスクスケジューラを管理者として実行してから削除する
-3. `register_logon_task.bat` を実行する。登録後すぐに新しい構成でトレイが起動する
+3. 新しい版のファイルを展開する。次のどちらかにする
+   - 今のフォルダーに上書きで展開し、旧構成だけにあったファイルを削除する。フォルダー直下の `app_settings.py`・`filename_rules.py`・`gmail_app.py`・`gmail_auth.py`・`gmail_monitor.py`・`job_queue.py`・`runtime_state.py`・`watchdog.py`・`windows_integration.py`・`reset_cursor.py`・`start_monitor.bat`・`stop_monitor.bat`・`start_test.bat`・`test_latest_attachment_download.bat`・`reset_last_check.bat`・`install_requirements.bat` と、`tests\run_virtual_download_test.bat`。フォルダー直下の古い `start_monitor.bat` を実行すると、新しいトレイとwatchdogが認識しない古い監視プロセスが起動する
+   - 新しいフォルダーに展開し、古いフォルダーから `config.ini` と `state\` フォルダーをコピーする。`state\` をコピーしないと処理キューとメールの確認位置が引き継がれず、保存済みの添付をもう一度保存することがある
+4. `setup.bat` を実行する
+5. `register_logon_task.bat` を実行する。登録後すぐに新しい構成でトレイが起動する
 
-`config.ini`・`state\`・`log\` の場所は変わらないため、設定と処理キューはそのまま引き継がれる。
+上書きで展開した場合は `config.ini`・`state\`・`log\` の場所が変わらないため、設定と処理キューはそのまま引き継がれる。
 
 ## テスト
 
