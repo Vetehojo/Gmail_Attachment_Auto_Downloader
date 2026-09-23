@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.14 がサポート・テスト対象のバージョン。
+        python-version: ["3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile runtime modules
+        run: >-
+          python -m py_compile
+          app_settings.py filename_rules.py gmail_app.py gmail_auth.py
+          job_queue.py gmail_monitor.py runtime_state.py watchdog.py
+          windows_integration.py reset_cursor.py
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v

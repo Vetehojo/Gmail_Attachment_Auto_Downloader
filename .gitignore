@@ -1,0 +1,18 @@
+# Secrets, per-PC configuration and runtime state.
+# 認証情報の実体は %LOCALAPPDATA%\GmailAutoDownloader 配下だが、
+# 誤ってアプリフォルダーへ置かれた場合に備えて除外を残す。
+credentials.json
+service_account.json
+token.json
+token.json.invalid.*
+token.pickle
+config.ini
+log/
+state/
+__pycache__/
+*.pyc
+
+# app_settings.save_settings() writes config.ini via this temp file first.
+config.ini.tmp
+# Local Claude Code agent config, not part of the distributed app.
+.claude/

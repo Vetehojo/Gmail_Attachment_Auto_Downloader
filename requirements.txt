@@ -1,0 +1,8 @@
+# 下限は各パッケージの最新stable、上限は次のメジャーまで。
+# 最新stableを常に採用できる状態を保ち、破壊的メジャー更新だけを止める。
+google-api-python-client>=2.199,<3
+google-auth>=2.57,<3
+google-auth-httplib2>=0.4,<1
+google-auth-oauthlib>=1.4,<2
+pystray>=0.19.5,<1
+Pillow>=12,<13
