@@ -16,7 +16,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_DIR = os.path.join(REPO_ROOT, "app")
 # Script paths each bat must pass, exactly as written in the bat.
 BAT_SCRIPT_PATHS = {
-    "setup.bat": {r"%~dp0app\gmail_app.py"},
+    "setup.bat": {r"%~dp0app\gmail_app.py", r"%~dp0app\gmail_monitor.py"},
+    "trial_download.bat": {r"%~dp0app\gmail_monitor.py"},
     "register_logon_task.bat": {
         r"%~dp0app\gmail_app.py",
         r"%~dp0app\watchdog.py",
@@ -52,6 +53,7 @@ class RuntimePathLayoutTest(unittest.TestCase):
             "watchdog.HEARTBEAT_FILE": (watchdog.HEARTBEAT_FILE, os.path.join(state, "heartbeat.json")),
             "gmail_monitor.LOCK_FILE": (gmail_monitor.LOCK_FILE, os.path.join(state, "monitor.lock")),
             "gmail_app.APP_LOCK_FILE": (gmail_app.APP_LOCK_FILE, os.path.join(state, "app.lock")),
+            "gmail_monitor.TRAY_LOCK_FILE": (gmail_monitor.TRAY_LOCK_FILE, os.path.join(state, "app.lock")),
             "watchdog.STATE_FILE": (watchdog.STATE_FILE, os.path.join(state, "watchdog_state.json")),
             "gmail_monitor.LOG_FILE": (gmail_monitor.LOG_FILE, os.path.join(log, "mail_log.txt")),
             "gmail_app.TRAY_LOG": (gmail_app.TRAY_LOG, os.path.join(log, "tray_log.txt")),
@@ -178,6 +180,43 @@ class BatScriptPathTest(unittest.TestCase):
                     if "-X utf8" in line:
                         self.assertIn("pythonw.exe", line)
                         self.assertNotIn("_PY%", line)
+
+    def test_dp0_is_quoted_in_echo_lines(self):
+        # An unquoted path with ")" or "&" breaks an echo inside a ( ) block.
+        for rel in BAT_SCRIPT_PATHS:
+            with self.subTest(rel):
+                for line in self._read(rel).decode("ascii").splitlines():
+                    if not re.match(r"(?i)\s*echo\b", line):
+                        continue
+                    for match in re.finditer(r"%~dp0", line):
+                        self.assertEqual(1, line[: match.start()].count('"') % 2, f"unquoted: {line}")
+
+    def test_trial_runs_the_monitor_with_trial_3(self):
+        for rel in ("setup.bat", "trial_download.bat"):
+            with self.subTest(rel):
+                self.assertIn('python "%MONITOR_PY%" --trial 3', list(self._command_lines(rel)))
+        self.assertEqual("exit /b %EXIT_CODE%", list(self._command_lines("trial_download.bat"))[-1])
+
+    def test_no_bat_starts_the_tray_directly(self):
+        for rel in BAT_SCRIPT_PATHS:
+            with self.subTest(rel):
+                self.assertEqual([], [line for line in self._command_lines(rel) if re.match(r"(?i)start\b", line)])
+
+    def test_register_runs_the_registered_monitor_task_only_after_success(self):
+        rel = "register_logon_task.bat"
+        lines = list(self._command_lines(rel))
+        run = '"%SCHTASKS%" /Run /TN "Gmail Auto Downloader Monitor" >nul'
+        self.assertIn(r'set "SCHTASKS=%SystemRoot%\System32\schtasks.exe"', lines)
+        self.assertEqual(1, sum("/Run" in line for line in lines))
+        register = next(i for i, line in enumerate(lines) if line.startswith('python "%INTEGRATION_PY%" register-tasks'))
+        self.assertEqual("if errorlevel 1 goto :END_ERROR", lines[register + 1])
+        # Only the success path reaches the run: after the check, before :END_OK / :END_ERROR.
+        self.assertLess(register + 1, lines.index(run))
+        self.assertLess(lines.index(run), lines.index(":END_OK"))
+        self.assertLess(lines.index(":END_OK"), lines.index(":END_ERROR"))
+        self.assertNotIn("IsUserAnAdmin", self._read(rel).decode("ascii"))
+        with open(os.path.join(APP_DIR, "windows_integration.py"), encoding="utf-8") as handle:
+            self.assertIn('"name": "Gmail Auto Downloader Monitor"', handle.read())
 
 
 if __name__ == "__main__":

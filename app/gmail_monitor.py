@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -23,6 +24,7 @@ from app_settings import (
     AUTH_DWD,
     BASE_DIR,
     get_account_configs,
+    is_configured,
     load_allowed_extensions,
     load_excluded_labels,
     load_settings,
@@ -37,7 +39,11 @@ STATE_DIR = os.path.join(BASE_DIR, "state")
 QUEUE_DB = os.path.join(STATE_DIR, "jobs.sqlite3")
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
 LOCK_FILE = os.path.join(STATE_DIR, "monitor.lock")
+# The tray's single-instance lock (gmail_app.APP_LOCK_FILE); the trial checks it.
+TRAY_LOCK_FILE = os.path.join(STATE_DIR, "app.lock")
 LOG_FILE = os.path.join(BASE_DIR, "log", "mail_log.txt")
+MONITOR_MUTEX_NAME = "Local\\GmailAutoDownloaderMonitor"
+TRAY_MUTEX_NAME = "Local\\GmailAutoDownloaderTray"
 MAIL_CURSOR_KEY = "mail_cursor_timestamp"
 RETENTION_KEY = "jobs_retention_last_run"
 LAST_ERROR_KEY = "monitor_last_error"
@@ -50,6 +56,12 @@ MAX_JOBS_PER_ONCE = 20
 MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024
 TEMP_PREFIX = ".gmailad_"
 TEMP_SUFFIX = ".tmp"
+TRIAL_DEFAULT_MESSAGES = 3
+TRIAL_MAX_MESSAGES = 20
+TRIAL_SCAN_CAP = 100
+TRIAL_EXIT_OK = 0
+TRIAL_EXIT_FAILED = 1
+TRIAL_EXIT_BLOCKED = 2
 _INLINE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".svg"}
 
 
@@ -85,10 +97,16 @@ def build_mail_query(start_time, target_email=None, auth_mode=None, excluded_lab
     drop BCC, aliases, Groups/ML delivery and forwarded messages.
     """
     del target_email, auth_mode
-    query = f"after:{int(start_time.timestamp())} in:inbox"
-    for label in excluded_labels or []:
-        query += f' -label:"{label}"'
-    return query
+    return f"after:{int(start_time.timestamp())} in:inbox" + _excluded_label_terms(excluded_labels)
+
+
+def build_trial_query(excluded_labels=None):
+    """The trial ignores the setup period: no after:, Gmail's default order (newest first)."""
+    return "in:inbox has:attachment" + _excluded_label_terms(excluded_labels)
+
+
+def _excluded_label_terms(excluded_labels):
+    return "".join(f' -label:"{label}"' for label in excluded_labels or [])
 
 
 def iter_message_ids(service, query, account_email=""):
@@ -216,6 +234,17 @@ def _attachment_job_key(account_email, message_id, attachment):
 
 
 def enqueue_message_jobs(queue, service, message_id, account_email="", final_dir=None, allowed_extensions=None):
+    """Returns how many new jobs were created (scan_gmail's count)."""
+    return enqueue_message(queue, service, message_id, account_email, final_dir, allowed_extensions)["added"]
+
+
+def enqueue_message(queue, service, message_id, account_email="", final_dir=None, allowed_extensions=None):
+    """Enqueue one message's allowed attachments and describe the result.
+
+    Returns a dict: "added" (new jobs), "job_keys" (every allowed attachment's
+    key, new or already queued), "skipped" (disallowed attachments with
+    filename/size/reason), "subject" and "received_date".
+    """
     settings = load_settings()
     account_email = _account_id(account_email) or _account_id(settings.get("target_email"))
     final_dir = os.path.abspath(final_dir or settings.get("final_dir") or ".")
@@ -240,6 +269,8 @@ def enqueue_message_jobs(queue, service, message_id, account_email="", final_dir
     }
 
     added = 0
+    job_keys = []
+    skipped = []
     attachments, inline_image_skips = get_attachments_from_payload(payload)
     if inline_image_skips:
         log(f"Skipped {inline_image_skips} inline image part(s): subject={subject}", "scan")
@@ -250,6 +281,7 @@ def enqueue_message_jobs(queue, service, message_id, account_email="", final_dir
                 f"Skipped attachment: subject={subject} file={attachment['filename']} reason={reason}",
                 "scan",
             )
+            skipped.append({"filename": attachment["filename"], "size": attachment["size"], "reason": reason})
             continue
         # Attachment bytes never enter the job payload persisted to SQLite;
         # the worker re-fetches them via attachment_id or (message_id, part_id).
@@ -260,9 +292,17 @@ def enqueue_message_jobs(queue, service, message_id, account_email="", final_dir
             "inline": bool(not attachment.get("attachment_id") and attachment.get("inline_data")),
             "filename": attachment["filename"],
         })
-        if queue.enqueue(_attachment_job_key(account_email, message_id, attachment), job_payload):
+        job_key = _attachment_job_key(account_email, message_id, attachment)
+        job_keys.append(job_key)
+        if queue.enqueue(job_key, job_payload):
             added += 1
-    return added
+    return {
+        "added": added,
+        "job_keys": job_keys,
+        "skipped": skipped,
+        "subject": subject,
+        "received_date": received_date,
+    }
 
 
 def scan_gmail(queue, service, account_email=None, final_dir=None, auth_mode=None):
@@ -620,6 +660,15 @@ def process_one_job(queue, pool):
     job = queue.claim_next()
     if job is None:
         return False
+    run_claimed_job(queue, pool, job)
+    return True
+
+
+def run_claimed_job(queue, pool, job):
+    """Save one claimed job and record the outcome through the normal
+    success/failure path. Returns (outcome, detail): ("success", result),
+    ("deferred", error) for authentication, or (mark_failure's disposition,
+    error)."""
     payload = job.get("payload") or {}
     account_email = _account_id(payload.get("account_email"))
     try:
@@ -635,18 +684,18 @@ def process_one_job(queue, pool):
         except OSError:
             pass
         log(f"Attachment job {job['id']} succeeded [{account_email}]", "worker")
+        return "success", result
     except Exception as exc:
         if _is_auth_error(exc):
             pool.invalidate(account_email)
             queue.defer_job(job["id"], exc, AUTH_DEFER_SECONDS)
             log(f"Attachment job {job['id']} deferred for authentication [{account_email}]: {exc}", "worker")
-        else:
-            disposition = queue.mark_failure(job["id"], exc)
-            log(f"Attachment job {job['id']} {disposition} [{account_email}]: {exc}", "worker")
-            if disposition == "failed":
-                _write_failure_notice(job, exc)
-        return True
-    return True
+            return "deferred", exc
+        disposition = queue.mark_failure(job["id"], exc)
+        log(f"Attachment job {job['id']} {disposition} [{account_email}]: {exc}", "worker")
+        if disposition == "failed":
+            _write_failure_notice(job, exc)
+        return disposition, exc
 
 
 def process_jobs(queue, pool=None, limit=MAX_JOBS_PER_ONCE):
@@ -734,16 +783,394 @@ def test_recent_emails(max_results):
     print(json.dumps(results, ensure_ascii=False, indent=2))
 
 
+# --- Trial download (--trial N) ----------------------------------------------
+# Saves only the newest N attachment mails of each account so a first-time
+# user can check the save folder and file names before automatic fetching
+# starts. It never calls scan_gmail/scan_all_accounts, which advance the mail
+# cursors and write LAST_ERROR_KEY: the trial writes no cursor, pause,
+# LAST_ERROR or WORKER_* metadata, and a job failure is recorded only on the
+# job by the normal job path. It reuses iter_message_ids and run_claimed_job
+# as they are, so heartbeat.json and mail_log.txt are written as usual.
+
+TRIAL_TRAY_RUNNING_TEXT = (
+    "自動取得（トレイアプリまたは監視プロセス）が動作中です。トレイアプリを終了してから実行してください。\n"
+    "トレイメニューの「終了（自動取得を停止）」で終了できます。"
+)
+TRIAL_REDOWNLOAD_NOTE = (
+    "※ 保存済みの添付は、もう一度実行しても、保存先やファイル名の設定を変えても保存し直しません"
+    "（自動取得でも同じです）。トレイメニューの「添付を取り直す」は、記録した保存先へ"
+    "現在のファイル名の設定で保存し直します。"
+)
+
+
+def _lock_is_free(name, lock_path):
+    """True when no other process holds this single-instance lock. An OSError
+    from CreateMutexW (e.g. the owner runs elevated) counts as held."""
+    probe = SingleInstance(name, lock_path)
+    try:
+        if not probe.acquire():
+            return False
+    except OSError:
+        return False
+    probe.release()
+    return True
+
+
+def select_trial_messages(queue, service, account, count, excluded_labels, allowed_extensions, report,
+                          scan_cap=TRIAL_SCAN_CAP):
+    """Fill report["messages"] with the newest `count` messages that have at
+    least one allowed attachment job (new or already queued), scanning at most
+    scan_cap messages. Messages without one go to report["skipped"]; a message
+    deleted between list and get (404) is only counted in report["gone"]."""
+    email = account["email"]
+    for message_id in iter_message_ids(service, build_trial_query(excluded_labels), email):
+        report["scanned"] += 1
+        try:
+            detail = enqueue_message(queue, service, message_id, email, account["final_dir"], allowed_extensions)
+        except HttpError as exc:
+            if getattr(getattr(exc, "resp", None), "status", None) != 404:
+                raise
+            report["gone"] += 1
+            detail = None
+        if detail is not None:
+            entry = {
+                "subject": detail["subject"],
+                "received_date": detail["received_date"],
+                "job_keys": detail["job_keys"],
+                "skipped": detail["skipped"],
+                "jobs": [],
+            }
+            if detail["job_keys"]:
+                report["messages"].append(entry)
+            else:
+                report["skipped"].append(entry)
+        if len(report["messages"]) >= count:
+            break
+        if report["scanned"] >= scan_cap:
+            report["capped"] = True
+            break
+
+
+def _describe_trial_job(job):
+    if job is None:
+        return {"state": "missing", "filename": ""}
+    info = {"filename": (job.get("payload") or {}).get("filename", ""), "error": job.get("last_error") or ""}
+    if job["status"] == "success":
+        path = (job.get("result") or {}).get("target_path", "")
+        info.update(state="already", path=path, file_missing=bool(path) and not os.path.isfile(path))
+    elif job["ignored"]:
+        info["state"] = "ignored"
+    elif job["status"] == "failed":
+        info["state"] = "failed_before"
+    elif job["status"] == "processing":
+        info["state"] = "processing"
+    else:
+        info.update(state="waiting", next_attempt_at=job["next_attempt_at"])
+    return info
+
+
+def run_trial_job(queue, pool, job_key):
+    """Process one of the trial's own jobs, never another queued job. A saved
+    job is never saved again; failed, ignored and not-yet-due jobs are only
+    reported."""
+    job = queue.get_job_by_key(job_key)
+    if job is not None and job["status"] == "pending" and not job["ignored"]:
+        claimed = queue.claim_job(job["id"])
+        if claimed is not None:
+            outcome, detail = run_claimed_job(queue, pool, claimed)
+            info = {"filename": (claimed.get("payload") or {}).get("filename", "")}
+            if outcome == "success":
+                path = detail.get("target_path", "")
+                info.update(state="saved", path=path, file_missing=not os.path.isfile(path))
+            else:
+                info.update(state=outcome, error=str(detail))
+            return info
+        job = queue.get_job_by_key(job_key)
+    return _describe_trial_job(job)
+
+
+def run_trial(queue, count=TRIAL_DEFAULT_MESSAGES, pool=None, scan_cap=TRIAL_SCAN_CAP):
+    settings = load_settings()
+    mode = normalize_auth_mode(settings.get("auth_mode"))
+    pool = pool or ServicePool(mode)
+    excluded_labels = load_excluded_labels(settings)
+    allowed_extensions = load_allowed_extensions(settings)
+    reports = []
+    for account in get_account_configs(settings):
+        report = {
+            "account": account["email"],
+            "final_dir": account["final_dir"],
+            "mode": mode,
+            "messages": [],
+            "skipped": [],
+            "scanned": 0,
+            "gone": 0,
+            "capped": False,
+            "error": "",
+            "auth_error": False,
+        }
+        try:
+            service = pool.get(account["email"])
+            select_trial_messages(
+                queue, service, account, count, excluded_labels, allowed_extensions, report, scan_cap
+            )
+        except Exception as exc:
+            # One failing account (e.g. a DWD mailbox without delegation) is
+            # reported; the other accounts still run.
+            pool.invalidate(account["email"])
+            report["error"] = str(exc) or type(exc).__name__
+            report["auth_error"] = _is_auth_error(exc)
+            log(f"Trial failed [{account['email']}]: {exc}", "trial")
+        # Messages selected before an error are still processed.
+        for message in report["messages"]:
+            message["jobs"] = [run_trial_job(queue, pool, key) for key in message["job_keys"]]
+        reports.append(report)
+    return reports
+
+
+def trial_exit_code(reports):
+    if reports and all(report["error"] and report["auth_error"] for report in reports):
+        return TRIAL_EXIT_BLOCKED
+    for report in reports:
+        if report["error"]:
+            return TRIAL_EXIT_FAILED
+        for message in report["messages"]:
+            if any(job["state"] not in ("saved", "already") for job in message["jobs"]):
+                return TRIAL_EXIT_FAILED
+    return TRIAL_EXIT_OK
+
+
+def _trial_date(received_date):
+    text = str(received_date or "")
+    return f"{text[:4]}/{text[4:6]}/{text[6:]}" if len(text) == 8 and text.isdigit() else text
+
+
+def _trial_skip_reason(item):
+    reason = item.get("reason", "")
+    extension = os.path.splitext(item.get("filename") or "")[1].lower()
+    if reason == f"extension {extension} is not allowed":
+        return f"拡張子 {extension or '(なし)'} は保存対象外"
+    if reason == "attachment exceeds the 100MB limit":
+        return "100MBの上限を超えています"
+    return reason
+
+
+def _trial_job_text(job):
+    name = job.get("filename") or "添付"
+    error = job.get("error", "")
+    state = job["state"]
+    if state in ("saved", "already") and job.get("file_missing"):
+        return f"保存済みと記録されていますが、ファイルが見つかりません: {job['path']}"
+    if state == "saved":
+        return f"保存しました: {job['path']}"
+    if state == "already":
+        if job.get("path"):
+            return f"保存済みです（前回までに保存）: {job['path']}"
+        return f"保存済みです（{name}。古い記録のため保存先の記録はありません）"
+    if state == "failed_before":
+        return f"以前の取得で失敗しています（もう一度は取得しません）: {name} - {error}"
+    if state == "ignored":
+        return f"「無視」に設定された添付です（取得しません）: {name}"
+    if state == "waiting":
+        when = datetime.fromtimestamp(job.get("next_attempt_at") or 0).strftime("%Y/%m/%d %H:%M")
+        return f"再試行待ちです（{when}以降）: {name} - {error}"
+    if state == "processing":
+        return f"処理中のままです: {name}"
+    if state == "retry":
+        return f"保存できませんでした（自動取得の開始後に再試行します）: {name} - {error}"
+    if state == "deferred":
+        return f"認証エラーのため保存を保留しました: {name} - {error}"
+    if state == "missing":
+        return f"処理キューに見つかりません: {name}"
+    return f"保存できませんでした: {name} - {error}"
+
+
+def _trial_auth_hint(mode):
+    # _is_auth_error also covers HTTP 403 such as a Gmail API that is not enabled.
+    if mode == AUTH_DWD:
+        return (
+            "Gmailの認証またはAPIアクセスに失敗しました。Google Cloud プロジェクトで Gmail API が有効か、"
+            "Google管理コンソールでドメイン全体の委任（gmail.readonly）が承認されているかを確認し、"
+            "設定画面の「登録した全アカウントに接続してテスト」で確かめてください。"
+        )
+    return (
+        "Gmailの認証またはAPIアクセスに失敗しました。Google Cloud プロジェクトで Gmail API が有効かを確認し、"
+        "設定画面の「Googleに接続してテスト」で認証を済ませてから、もう一度実行してください。"
+    )
+
+
+def _is_under(path, folder):
+    path = os.path.normcase(os.path.abspath(path))
+    folder = os.path.normcase(os.path.abspath(folder))
+    try:
+        return os.path.commonpath([path, folder]) == folder
+    except ValueError:  # different drives
+        return False
+
+
+def format_trial_report(reports, count, exit_code):
+    lines = []
+    saved = already = problems = 0
+    file_missing = False
+    for report in reports:
+        lines.append("")
+        lines.append(f"[{report['account']}]  保存先: {report['final_dir']}")
+        elsewhere = False
+        for index, message in enumerate(report["messages"], 1):
+            lines.append(f"  {index}. {_trial_date(message['received_date'])} 件名「{message['subject']}」")
+            for job in message["jobs"]:
+                lines.append("     " + _trial_job_text(job))
+                file_missing = file_missing or bool(job.get("file_missing"))
+                if job.get("path") and not _is_under(job["path"], report["final_dir"]):
+                    elsewhere = True
+                if job["state"] == "saved":
+                    saved += 1
+                elif job["state"] == "already":
+                    already += 1
+                else:
+                    problems += 1
+            for item in message["skipped"]:
+                lines.append(f"     対象外: {item['filename']}（{_trial_skip_reason(item)}）")
+        if elsewhere:
+            lines.append(
+                "  ※ 現在の保存先とは別の場所に記録された添付があります。"
+                "保存先の設定を変えても、保存済みの添付は移動も再保存もされません。"
+            )
+        if report["skipped"]:
+            lines.append(f"  保存対象の添付が無いため数えなかったメール: {len(report['skipped'])}件")
+            for message in report["skipped"][:5]:
+                reasons = "、".join(
+                    f"{item['filename']}（{_trial_skip_reason(item)}）" for item in message["skipped"]
+                ) or "本文に埋め込まれた画像のみ"
+                lines.append(f"     {_trial_date(message['received_date'])} 件名「{message['subject']}」: {reasons}")
+            if len(report["skipped"]) > 5:
+                lines.append(f"     ほか{len(report['skipped']) - 5}件")
+        if report["gone"]:
+            lines.append(f"  確認中に削除されたメール {report['gone']}件を飛ばしました。")
+        found = len(report["messages"])
+        if report["error"]:
+            lines.append(f"  エラー: {report['error']}")
+            if report["auth_error"]:
+                lines.append("  " + _trial_auth_hint(report["mode"]))
+        elif found == 0:
+            lines.append(
+                f"  保存対象の添付があるメールは見つかりませんでした（新しい順に{report['scanned']}件を確認）。"
+            )
+        elif found < count and report["capped"]:
+            lines.append(
+                f"  新しい順に{report['scanned']}件まで確認しましたが、"
+                f"保存対象の添付があるメールは{found}件でした。"
+            )
+        elif found < count:
+            lines.append(f"  保存対象の添付があるメールは{found}件だけでした。")
+    lines.append("")
+    lines.append(f"結果: 保存 {saved}件 / 保存済み {already}件 / 保存できなかった添付 {problems}件")
+    if file_missing:
+        lines.append(
+            "※ 見つからないファイルは、自動取得の開始後にトレイメニューの「添付を取り直す」で、"
+            "記録した保存先へ保存し直せます。"
+        )
+    lines.append(TRIAL_REDOWNLOAD_NOTE)
+    if exit_code == TRIAL_EXIT_OK:
+        lines.append(
+            "保存先のファイル名と内容を確認してください。問題なければ register_logon_task.bat を実行して"
+            "自動取得を開始してください。"
+        )
+    else:
+        lines.append("お試し取得を完了できませんでした。上の内容を確認してください。")
+    return lines
+
+
+def run_trial_cli(count=TRIAL_DEFAULT_MESSAGES):
+    """Exit codes: TRIAL_EXIT_OK when every selected job is saved or already
+    saved; TRIAL_EXIT_BLOCKED when the tray/monitor is running, the app is not
+    configured, or authentication/API access failed for every account;
+    TRIAL_EXIT_FAILED otherwise."""
+    instance = SingleInstance(MONITOR_MUTEX_NAME, LOCK_FILE)
+    try:
+        acquired = instance.acquire()
+    except OSError:
+        acquired = False
+    if not acquired:
+        print(TRIAL_TRAY_RUNNING_TEXT)
+        return TRIAL_EXIT_BLOCKED
+    try:
+        if not _lock_is_free(TRAY_MUTEX_NAME, TRAY_LOCK_FILE):
+            print(TRIAL_TRAY_RUNNING_TEXT)
+            return TRIAL_EXIT_BLOCKED
+        if not is_configured():
+            print("設定が完了していません。setup.bat を実行して設定を保存してから、もう一度実行してください。")
+            return TRIAL_EXIT_BLOCKED
+        queue = JobQueue(QUEUE_DB)
+        # An interrupted trial (Ctrl+C, closed window) is recovered like a monitor
+        # restart, including its temp files; safe while the monitor lock is held.
+        recover_interrupted_jobs(queue)
+        removed = cleanup_orphan_temp_files(
+            [account["final_dir"] for account in get_account_configs(load_settings())]
+        )
+        if removed:
+            log(f"Removed {removed} orphan temp file(s) left by a previous run", "trial")
+        print(
+            f"お試し取得: 各アカウントの受信トレイから、保存対象の添付があるメールを新しい順に最大{count}件保存します。\n"
+            "設定画面の取込期間は使わず、自動取得の確認位置も変更しません。しばらくお待ちください。",
+            flush=True,
+        )
+        log(f"Trial started: newest {count} attachment message(s) per account", "trial")
+        reports = run_trial(queue, count)
+        exit_code = trial_exit_code(reports)
+        for line in format_trial_report(reports, count, exit_code):
+            print(line)
+        log(f"Trial finished: exit={exit_code}", "trial")
+        return exit_code
+    except KeyboardInterrupt:
+        print(
+            "\n中断しました。途中だった添付は、もう一度実行したときにそのメールがまだ新しい順の対象に入っていれば、"
+            "続きから保存します。入っていなければ、自動取得の開始後に保存されます。"
+        )
+        log("Trial interrupted by user", "trial")
+        return TRIAL_EXIT_FAILED
+    finally:
+        instance.release()
+
+
+def recover_interrupted_jobs(queue):
+    """Run at startup while holding the monitor lock (monitor and trial)."""
+    reconciled = reconcile_completed_jobs(queue)
+    if reconciled:
+        log(f"Reconciled {reconciled} completed attachment job(s) after interruption", "queue")
+    recovered = queue.recover_processing_jobs()
+    if recovered:
+        log(f"Recovered {recovered} interrupted attachment job(s)", "queue")
+
+
+def _trial_count(text):
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if not 1 <= value <= TRIAL_MAX_MESSAGES:
+        raise argparse.ArgumentTypeError(f"1～{TRIAL_MAX_MESSAGES}の数を指定してください: {text}")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--test-recent", type=int, default=0)
+    parser.add_argument(
+        "--trial", nargs="?", const=TRIAL_DEFAULT_MESSAGES, type=_trial_count, metavar="N",
+        help="各アカウントの最新N件（既定3）の添付付きメールだけを保存するお試し取得",
+    )
     args = parser.parse_args()
+    if args.trial is not None:
+        # Redirected output must never crash the run after files are saved.
+        sys.stdout.reconfigure(errors="replace")
+        return run_trial_cli(args.trial)
     if args.test_recent:
         test_recent_emails(args.test_recent)
         return 0
 
-    instance = SingleInstance("Local\\GmailAutoDownloaderMonitor", LOCK_FILE)
+    instance = SingleInstance(MONITOR_MUTEX_NAME, LOCK_FILE)
     if not instance.acquire():
         log("Another gmail_monitor.py instance is already running; exiting", "main")
         return 0
@@ -752,12 +1179,7 @@ def main():
     worker = None
     try:
         queue = JobQueue(QUEUE_DB)
-        reconciled = reconcile_completed_jobs(queue)
-        if reconciled:
-            log(f"Reconciled {reconciled} completed attachment job(s) after interruption", "queue")
-        recovered = queue.recover_processing_jobs()
-        if recovered:
-            log(f"Recovered {recovered} interrupted attachment job(s)", "queue")
+        recover_interrupted_jobs(queue)
         maybe_apply_retention(queue, force=True)
 
         settings = load_settings()

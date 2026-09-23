@@ -14,7 +14,7 @@ set "MONITOR_PY=%~dp0..\app\gmail_monitor.py"
 pushd "%~dp0.."
 if errorlevel 1 (
     echo [ERROR] Failed to access install folder.
-    echo   %~dp0..
+    echo   "%~dp0.."
     echo.
     goto :END_ERROR
 )

@@ -97,6 +97,26 @@ class JobQueue:
             claimed = conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
             return self._row_to_job(claimed)
 
+    def claim_job(self, job_id, now=None):
+        """claim_next for one given job, with the same guards: it must be
+        pending, not ignored and due (next_attempt_at <= now). Returns None
+        when the job is not claimable."""
+        now = time.time() if now is None else float(now)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'processing', attempts = attempts + 1, updated_at = ?
+                WHERE id = ? AND status = 'pending' AND ignored = 0 AND next_attempt_at <= ?
+                """,
+                (now, int(job_id), now),
+            )
+            if cur.rowcount != 1:
+                return None
+            claimed = conn.execute("SELECT * FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+            return self._row_to_job(claimed)
+
     def mark_success(self, job_id, result=None):
         """Mark only an active, non-ignored job successful."""
         now = time.time()
@@ -240,6 +260,16 @@ class JobQueue:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
         return self._row_to_job(row)
+
+    def get_job_by_key(self, job_key):
+        """Like get_job, plus "result": the recorded save result of a success
+        (None when there is none, e.g. after retention compaction)."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE job_key = ?", (job_key,)).fetchone()
+        job = self._row_to_job(row)
+        if job is not None:
+            job["result"] = json.loads(row["result_json"]) if row["result_json"] else None
+        return job
 
     def recover_processing_jobs(self):
         """Processing rows are stale after a monitor restart; the claim itself is not an attempt."""

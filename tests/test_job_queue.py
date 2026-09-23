@@ -122,6 +122,59 @@ class JobQueueTest(unittest.TestCase):
             self.assertIsNone(compacted["result_json"])
             self.assertIsNone(deleted)
 
+    def test_claim_job_claims_only_that_due_pending_job(self):
+        with tempfile.TemporaryDirectory() as td:
+            queue = JobQueue(os.path.join(td, "jobs.sqlite3"))
+            queue.enqueue("attachment:m1:a", {"n": 1})
+            queue.enqueue("attachment:m2:b", {"n": 2})
+            second = queue.get_job_by_key("attachment:m2:b")
+
+            claimed = queue.claim_job(second["id"], now=100)
+            self.assertEqual(second["id"], claimed["id"])
+            self.assertEqual("processing", claimed["status"])
+            self.assertEqual(1, claimed["attempts"])
+            self.assertIsNone(queue.claim_job(second["id"], now=100))
+            first = queue.get_job_by_key("attachment:m1:a")
+            self.assertEqual("pending", first["status"])
+            self.assertEqual(0, first["attempts"])
+
+    def test_claim_job_respects_backoff_failed_ignored_and_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            queue = JobQueue(os.path.join(td, "jobs.sqlite3"))
+            queue.enqueue("attachment:backoff", {}, max_attempts=3)
+            backoff = queue.claim_next(now=100)
+            self.assertEqual("retry", queue.mark_failure(backoff["id"], "boom", retry_delays=(10**9,)))
+            self.assertIsNone(queue.claim_job(backoff["id"]))
+            self.assertIsNotNone(queue.claim_job(backoff["id"], now=10**12))
+
+            queue.enqueue("attachment:failed", {}, max_attempts=1)
+            failed = queue.claim_next(now=100)
+            self.assertEqual("failed", queue.mark_failure(failed["id"], "broken"))
+            self.assertIsNone(queue.claim_job(failed["id"], now=10**12))
+            self.assertTrue(queue.ignore_job(failed["id"]))
+            self.assertIsNone(queue.claim_job(failed["id"], now=10**12))
+
+            queue.enqueue("attachment:done", {})
+            done = queue.claim_next(now=10**12)
+            self.assertTrue(queue.mark_success(done["id"], {"target_path": "x"}))
+            self.assertIsNone(queue.claim_job(done["id"], now=10**12))
+            self.assertIsNone(queue.claim_job(999999, now=10**12))
+
+    def test_get_job_by_key_includes_the_recorded_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            queue = JobQueue(os.path.join(td, "jobs.sqlite3"))
+            self.assertIsNone(queue.get_job_by_key("attachment:none"))
+            queue.enqueue("attachment:m1:a", {"filename": "a.pdf"})
+            pending = queue.get_job_by_key("attachment:m1:a")
+            self.assertEqual("pending", pending["status"])
+            self.assertIsNone(pending["result"])
+            job = queue.claim_next()
+            queue.mark_success(job["id"], {"target_path": "C:\\final\\a.pdf"})
+            done = queue.get_job_by_key("attachment:m1:a")
+            self.assertEqual("success", done["status"])
+            self.assertEqual({"target_path": "C:\\final\\a.pdf"}, done["result"])
+            self.assertEqual({"filename": "a.pdf"}, done["payload"])
+
 
 if __name__ == "__main__":
     unittest.main()

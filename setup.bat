@@ -5,6 +5,8 @@ chcp 65001 >nul
 set "SDIR=%~dp0"
 if "%SDIR:~-1%"=="\" set "SDIR=%SDIR:~0,-1%"
 set "APP_PY=%~dp0app\gmail_app.py"
+set "MONITOR_PY=%~dp0app\gmail_monitor.py"
+set "CONFIG_INI=%~dp0config.ini"
 
 echo.
 echo ============================================
@@ -37,25 +39,64 @@ popd
 if not "%PIP_RESULT%"=="0" goto :END_ERROR
 
 echo [3/3] Opening setup window...
+rem config.ini's timestamp tells whether settings were saved in this run.
+rem --setup also exits 0 when the tray app is already running.
+call :CONFIG_STAMP
+set "STAMP_BEFORE=%STAMP%"
 pushd "%SDIR%"
 python "%APP_PY%" --setup
 set "GUI_RESULT=%ERRORLEVEL%"
 popd
 if not "%GUI_RESULT%"=="0" goto :END_ERROR
-
-if not exist "%SDIR%\config.ini" (
+call :CONFIG_STAMP
+if "%STAMP%"=="%STAMP_BEFORE%" (
     echo.
-    echo Setup was cancelled before configuration was saved.
+    echo Settings were not saved in this run.
+    echo If the tray app is already running, change settings from its menu instead.
     goto :END_OK
 )
 
-start "" "%PYTHONW%" "%APP_PY%"
+echo.
+echo Settings saved. Automatic fetching has not started yet.
+echo.
+echo A trial download saves only the newest 3 attachment mails of each account,
+echo so you can check the save folder and file names first.
+set "TRIAL_ANSWER=Y"
+set /p "TRIAL_ANSWER=Run the trial download now? [Y/n]: "
+rem Drop typed quotes so no answer can break the comparisons below.
+set "TRIAL_ANSWER=%TRIAL_ANSWER:"=%"
+if /i "%TRIAL_ANSWER%"=="n" goto :SKIP_TRIAL
+if /i "%TRIAL_ANSWER%"=="no" goto :SKIP_TRIAL
 
 echo.
-echo Setup complete. Tray app started.
-echo Register automatic startup with register_logon_task.bat when ready.
+pushd "%SDIR%"
+python "%MONITOR_PY%" --trial 3
+set "TRIAL_RESULT=%ERRORLEVEL%"
+popd
+if not "%TRIAL_RESULT%"=="0" (
+    echo.
+    echo [WARNING] The trial download did not finish cleanly. Exit code: %TRIAL_RESULT%
+    echo Your settings are saved. Check the messages above, then run
+    echo trial_download.bat to try again.
+)
+goto :NEXT_STEPS
+
+:SKIP_TRIAL
+echo Trial download skipped.
+
+:NEXT_STEPS
 echo.
+echo Next steps:
+echo   1. Check the files in the save folder.
+echo   2. Run register_logon_task.bat to register and start automatic fetching.
+echo To run the trial again, use trial_download.bat.
+echo It never saves an attachment that was already saved.
 goto :END_OK
+
+:CONFIG_STAMP
+set "STAMP=missing"
+for /f "usebackq delims=" %%s in (`python -c "import os; p = os.environ['CONFIG_INI']; print(os.stat(p).st_mtime_ns if os.path.isfile(p) else 'missing')"`) do set "STAMP=%%s"
+exit /b 0
 
 :PYTHONW_ERROR
 echo.
