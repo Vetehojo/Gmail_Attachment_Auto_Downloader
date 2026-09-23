@@ -614,21 +614,93 @@ class TaskTransactionTest(unittest.TestCase):
         )
         self.assertIn(b"changed", runner.tasks["App Task"])
 
+    UNVERIFIED_APP_TASK = (
+        "Created task 'App Task' could not be verified as this install's task "
+        "(install paths with characters outside the Windows code page cannot be registered)"
+    )
+    ROLLBACK_REFUSED = "; rollback verification failed: Rollback refused to touch a task that is no longer owned"
+
     def test_unverifiable_created_task_is_named_with_the_code_page_hint(self):
         specs = self.specs()
         specs[0]["script"] = r"C:\Café\gmail_app.py"
         runner = StatefulTaskRunner()
         with self.assertRaises(win.IntegrationError) as caught:
             register(runner, specs)
-        self.assertEqual(
-            "Created task 'App Task' could not be verified as this install's task "
-            "(install paths with characters outside the Windows code page cannot be registered)",
-            str(caught.exception),
-        )
-        # Not provably ours, so it is not deleted; nothing else was touched.
+        self.assertEqual(self.UNVERIFIED_APP_TASK + self.ROLLBACK_REFUSED, str(caught.exception))
+        # Recorded for rollback, but not provably ours, so it is not deleted.
         self.assertIn(rb"C:\Caf?\gmail_app.py", runner.tasks["App Task"])
         self.assertEqual(["App Task"], [name for name, _data, _path in runner.creates])
         self.assertFalse(any("/Delete" in command for command in runner.commands))
+
+    def test_foreign_readback_after_create_is_not_overwritten_with_the_original(self):
+        specs = self.specs()
+        original = task_xml(specs[0]["executable"], specs[0]["script"], description="original")
+        foreign_script = r"C:\Other\foreign.py"
+
+        def foreign_after_create(name, text):
+            # Another writer replaced the definition before the read-back.
+            return text.replace(specs[0]["script"], foreign_script)
+
+        runner = StatefulTaskRunner({"App Task": original}, tamper=foreign_after_create)
+        with self.assertRaises(win.IntegrationError) as caught:
+            register(runner, specs)
+        self.assertEqual(self.UNVERIFIED_APP_TASK + self.ROLLBACK_REFUSED, str(caught.exception))
+        self.assertTrue(win.action_is_owned(runner.tasks["App Task"], specs[0]["executable"], foreign_script))
+        # Only the create: no restore reached schtasks.
+        self.assertEqual(["App Task"], [name for name, _data, _path in runner.creates])
+        self.assertFalse(any("/Delete" in command for command in runner.commands))
+
+    def test_readback_failure_after_create_still_rolls_back_the_task(self):
+        specs = self.specs()
+        original = task_xml(specs[0]["executable"], specs[0]["script"], description="original")
+        failures = (
+            ("listing spawn", lambda c: "/FO" in c, None),
+            ("xml query", lambda c: "/Query" in c and "/XML" in c, win.CommandResult(1, b"", b"busy")),
+        )
+        for label, matches, error in failures:
+            for tasks in ({}, {"App Task": original}):
+                with self.subTest(failure=label, original_owned=bool(tasks)):
+                    runner = StatefulTaskRunner(tasks)
+                    failed = []
+
+                    def first_readback(command):
+                        # Only the read-back right after /Create fails; the rollback re-query works.
+                        if len(runner.creates) == 1 and not failed and matches(command):
+                            failed.append(command)
+                            return True
+                        return False
+
+                    with self.failing_runner(runner, first_readback, error):
+                        with self.assertRaises(win.IntegrationError) as caught:
+                            register(runner, specs)
+                    self.assertEqual(self.UNVERIFIED_APP_TASK, str(caught.exception))
+                    self.assertEqual(1, len(failed))
+                    self.assertNotIn("Watchdog Task", runner.tasks)
+                    deletes = [c[c.index("/TN") + 1] for c in runner.commands if "/Delete" in c]
+                    if tasks:
+                        self.assertEqual(win._xml_signature(original), win._xml_signature(runner.tasks["App Task"]))
+                        self.assertEqual(["App Task", "App Task"], [name for name, _data, _path in runner.creates])
+                        self.assertEqual(win._utf16_task_document(original), runner.creates[1][1])
+                        self.assertEqual([], deletes)
+                    else:
+                        self.assertNotIn("App Task", runner.tasks)
+                        self.assertEqual(["App Task"], [name for name, _data, _path in runner.creates])
+                        self.assertEqual(["App Task"], deletes)
+
+    def test_unverified_task_is_left_and_reported_when_the_rollback_requery_fails(self):
+        specs = self.specs()
+        original = task_xml(specs[0]["executable"], specs[0]["script"], description="original")
+        for tasks in ({}, {"App Task": original}):
+            with self.subTest(original_owned=bool(tasks)):
+                runner = StatefulTaskRunner(tasks)
+                with self.failing_runner(runner, lambda c: "/FO" in c and len(runner.creates) == 1):
+                    with self.assertRaises(win.IntegrationError) as caught:
+                        register(runner, specs)
+                self.assertEqual(self.UNVERIFIED_APP_TASK + self.ROLLBACK_REFUSED, str(caught.exception))
+                # The accepted definition is still installed; nothing touched it afterwards.
+                win.verify_task_definition(runner.tasks["App Task"], specs[0], resolve_sid(specs[0]["user"]), resolve_sid)
+                self.assertEqual(["App Task"], [name for name, _data, _path in runner.creates])
+                self.assertFalse(any("/Delete" in command for command in runner.commands))
 
     def test_second_create_failure_deletes_only_new_owned_first_task(self):
         specs = self.specs()

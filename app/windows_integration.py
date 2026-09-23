@@ -527,7 +527,7 @@ def _create_task(
     document: bytes,
     original_state: str,
     original_xml: bytes | None,
-) -> bytes:
+) -> None:
     current_state, current_xml = classify_task(
         runner, schtasks, str(spec["name"]), str(spec["executable"]), str(spec["script"])
     )
@@ -541,6 +541,9 @@ def _create_task(
     result = _run_create_xml(runner, schtasks, str(spec["name"]), document)
     if result.returncode != 0:
         raise IntegrationError("Task creation failed")
+
+
+def _read_back_created_task(runner: Runner, schtasks: str, spec: dict[str, object]) -> bytes:
     state, installed_xml = classify_task(
         runner, schtasks, str(spec["name"]), str(spec["executable"]), str(spec["script"])
     )
@@ -558,14 +561,16 @@ def _restore_task(
     spec: dict[str, object],
     original_state: str,
     original_xml: bytes | None,
-    installed_xml: bytes,
+    installed_xml: bytes | None,
 ) -> None:
     state, _current = classify_task(
         runner, schtasks, str(spec["name"]), str(spec["executable"]), str(spec["script"])
     )
     if state != OWNED or _current is None:
         raise IntegrationError("Rollback refused to touch a task that is no longer owned")
-    if _xml_signature(_current) != _xml_signature(installed_xml):
+    # installed_xml is None when the read-back after /Create failed: ownership
+    # is still required above, but there is no installed definition to compare.
+    if installed_xml is not None and _xml_signature(_current) != _xml_signature(installed_xml):
         raise IntegrationError("Rollback refused to overwrite task definition drift")
     if original_state == ABSENT:
         deleted = _run_tool(runner, [schtasks, "/Delete", "/F", "/TN", str(spec["name"])])
@@ -614,11 +619,15 @@ def register_tasks_transaction(
             raise IntegrationError("Task preflight found foreign or unknown state")
         originals.append((state, xml_bytes))
 
-    mutated: list[tuple[int, bytes]] = []
+    mutated: list[tuple[int, bytes | None]] = []
     try:
         for index, spec in enumerate(specs):
-            installed_xml = _create_task(runner, schtasks, spec, documents[index], *originals[index])
-            mutated.append((index, installed_xml))
+            _create_task(runner, schtasks, spec, documents[index], *originals[index])
+            # Recorded for rollback as soon as /Create succeeds, before the
+            # read-back that may fail; the installed XML is unknown until then.
+            mutated.append((index, None))
+            installed_xml = _read_back_created_task(runner, schtasks, spec)
+            mutated[-1] = (index, installed_xml)
             # Owned and recorded for rollback before its settings are judged.
             verify_task_definition(installed_xml, spec, expected_sids[index], resolve)
     except IntegrationError as original_error:
