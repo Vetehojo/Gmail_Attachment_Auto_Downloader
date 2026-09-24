@@ -352,7 +352,8 @@ class SaveOrderTest(SaveTestBase):
         real = gmail_app.save_settings
 
         def save_settings(values):
-            cursors.append(self.queue.get_metadata(gmail_app.MAIL_CURSOR_KEY))
+            # No mailbox recorded for the account yet: its pending start.
+            cursors.append(self.queue.get_metadata(runtime_state.pending_cursor_key(self.TARGET)))
             return real(values)
 
         with mock.patch.object(gmail_app, "save_settings", side_effect=save_settings), \
@@ -518,11 +519,14 @@ class MailboxCursorTest(SaveTestBase):
 
         self.assertAlmostEqual(chosen.timestamp(), self.first_scan("new@example.com").timestamp(), delta=60)
         self.assertIsNone(self.cursor())
+        self.assertIsNone(self.cursor("pending:new@example.com"))
 
     def test_rescan_before_an_older_installs_first_scan_is_kept_through_first_use(self):
         app = gmail_app.TrayApp.__new__(gmail_app.TrayApp)
         app.controller = self.controller
         chosen = datetime.now() - timedelta(days=20)
+        # The older version checked until an hour ago.
+        self.queue.set_metadata(gmail_app.MAIL_CURSOR_KEY, (datetime.now() - timedelta(hours=1)).timestamp())
 
         self.assertTrue(app.apply_scan_start(chosen))
         gmail_monitor.verify_mailbox_identity(self.queue, self.TARGET, ProfileService(self.TARGET))
@@ -530,6 +534,7 @@ class MailboxCursorTest(SaveTestBase):
         self.assertEqual([("stop_all", True)], self.events)
         self.assertAlmostEqual(chosen.timestamp(), self.first_scan(self.TARGET).timestamp(), delta=2)
         self.assertIsNone(self.cursor())
+        self.assertIsNone(self.cursor("pending:" + self.TARGET))
 
     def test_rescan_for_a_new_untested_alias_is_honored_after_test_and_save(self):
         # Mailbox m@ was checked an hour ago under alias a1@. The user types a
@@ -549,7 +554,25 @@ class MailboxCursorTest(SaveTestBase):
         start = self.first_scan("a2@example.com")
         self.assertAlmostEqual((chosen + timedelta(minutes=5)).timestamp(),
                                (start + gmail_monitor.QUERY_OVERLAP).timestamp(), delta=2)
-        self.assertIsNone(self.cursor())
+        self.assertIsNone(self.cursor("pending:a2@example.com"))
+
+    def test_another_accounts_pending_start_is_not_taken_over(self):
+        # External review scenario: b@ was used before (mailbox recorded, not
+        # scanned yet). The current untested account a2@ rescans from 1 day
+        # ago; the user switches back to b@ and saves without a test. b@'s
+        # first scan must reach lookback_days, not a2@'s start.
+        self.record("b@example.com", "b@example.com")
+        self.make_dialog(email="a2@example.com", final=self.final).save()
+        app = gmail_app.TrayApp.__new__(gmail_app.TrayApp)
+        app.controller = self.controller
+        self.assertTrue(app.apply_scan_start(datetime.now() - timedelta(days=1)))
+        self.assertIsNotNone(self.cursor("pending:a2@example.com"))
+
+        self.make_dialog(email="b@example.com", final=self.final).save()
+
+        self.assertEqual({"a2@example.com": "", "b@example.com": "b@example.com"}, self.identities())
+        start = self.first_scan("b@example.com")
+        self.assertAlmostEqual((datetime.now() - timedelta(days=7)).timestamp(), start.timestamp(), delta=60)
 
     def test_mailbox_change_with_a_period_writes_it_for_the_new_mailbox_only(self):
         checked = datetime.now() - timedelta(hours=1)
@@ -566,7 +589,9 @@ class MailboxCursorTest(SaveTestBase):
 
     def test_rescan_and_status_use_the_recorded_mailbox_cursor(self):
         summary = gmail_app.TrayApp.__new__(gmail_app.TrayApp)._cursor_summary
-        # Nothing recorded yet: the pending cursor.
+        # Nothing recorded yet: the account's pending start, once one is set.
+        self.assertEqual("未確認（0/1アカウント）", summary())
+        gmail_app.write_scan_start(self.queue, datetime.now() - timedelta(days=5), app_settings.load_settings())
         self.assertIn("確認済み 1/1アカウント", summary())
         self.queue.set_metadata(runtime_state.identity_key(self.TARGET), "owner@example.com")
         self.assertEqual("未確認（0/1アカウント）", summary())

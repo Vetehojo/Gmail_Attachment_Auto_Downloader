@@ -309,6 +309,31 @@ class MonitorPaginationTest(unittest.TestCase):
                 self.assertNotIn(gmail_monitor.MAIL_CURSOR_KEY, queue.metadata)
                 self.assertEqual([gmail_monitor.MAIL_CURSOR_KEY], queue.deleted_keys)
 
+    def test_only_the_scanned_accounts_pending_start_is_taken_over(self):
+        queue = verified_queue()
+        own = datetime.now() - timedelta(days=4)
+        queue.metadata["mail_cursor_timestamp:pending:a@example.com"] = str(own.timestamp())
+        queue.metadata["mail_cursor_timestamp:pending:b@example.com"] = "1700000000"
+
+        start = self.scan_start(queue)
+
+        self.assertEqual(int((own - gmail_monitor.QUERY_OVERLAP).timestamp()), start)
+        self.assertEqual(["mail_cursor_timestamp:pending:a@example.com"], queue.deleted_keys)
+        self.assertEqual("1700000000", queue.metadata["mail_cursor_timestamp:pending:b@example.com"])
+
+    def test_unreadable_pending_cursor_is_dropped_not_copied(self):
+        for pending_key in (gmail_monitor.MAIL_CURSOR_KEY, "mail_cursor_timestamp:pending:a@example.com"):
+            with self.subTest(pending_key=pending_key):
+                queue = verified_queue()
+                queue.metadata[pending_key] = "garbage"
+                before = datetime.now()
+
+                start = self.scan_start(queue)
+
+                self.assertLessEqual(start, int((before - timedelta(days=7)).timestamp()) + 2)
+                self.assertEqual([pending_key], queue.deleted_keys)
+                self.assertEqual(["mail_cursor_timestamp:a@example.com"], [key for key, _value in queue.set_calls])
+
     def test_dwd_scan_leaves_the_pending_oauth_cursor_alone(self):
         queue = FakeQueue()
         queue.metadata[gmail_monitor.MAIL_CURSOR_KEY] = str((datetime.now() - timedelta(hours=1)).timestamp())

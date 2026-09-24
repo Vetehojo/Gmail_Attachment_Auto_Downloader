@@ -44,6 +44,7 @@ from runtime_state import (
     end_settings_update,
     format_auth_issues,
     identity_key,
+    pending_cursor_key,
     read_auth_issues,
     read_heartbeat,
     settings_update_in_progress,
@@ -104,13 +105,14 @@ def write_scan_start(q, start, settings, identities=None):
     permanently larger window into later cursor-less scans for no benefit.
 
     `identities` are mailboxes a Save is recording (see cursor_key). An OAuth
-    account with no mailbox recorded yet gets the pending MAIL_CURSOR_KEY,
-    which the first scan of its recorded mailbox adopts.
+    account with no mailbox recorded yet gets its own pending key
+    (pending_cursor_key), which the first scan of its recorded mailbox adopts.
     """
     dwd = normalize_auth_mode(settings.get("auth_mode")) == AUTH_DWD
     timestamp = (start + timedelta(minutes=5)).timestamp()
     for account in get_account_configs(settings):
-        q.set_metadata(cursor_key(q, account["email"], dwd, identities) or MAIL_CURSOR_KEY, timestamp)
+        key = cursor_key(q, account["email"], dwd, identities) or pending_cursor_key(account["email"])
+        q.set_metadata(key, timestamp)
 
 
 SAVED_LATER_TEXT = "設定はまだ保存していません。「保存」を押すと反映します。"
@@ -286,6 +288,8 @@ def commit_settings(plan, q):
     # Before the identities, so a new mailbox can never find it.
     if plan["drop_pending_cursor"]:
         q.delete_metadata(MAIL_CURSOR_KEY)
+    for account in plan["pending_drops"]:
+        q.delete_metadata(pending_cursor_key(account))
     for account, value in plan["identity_writes"].items():
         q.set_metadata(identity_key(account), value)
     # Deferrals recorded under the old settings; a job still failing re-records one.
@@ -946,18 +950,24 @@ class SettingsDialog:
             (staged or {}).get("identities", {}),
             lambda account: q.get_metadata(identity_key(account)),
         )
-        # The pending OAuth cursor (MAIL_CURSOR_KEY) must not pass to another
-        # mailbox: drop it when the auth mode changes or Save records a
-        # different mailbox for an account - except when an account saved
-        # untested ("") is now verified, which is what it waits for. A legacy
-        # install (nothing recorded) that saves a verified mailbox drops it too;
-        # the next scan then starts from lookback_days, which re-lists mail
-        # but saves no duplicate files (job keys per account, kept 730 days).
+        # An older version's OAuth cursor (MAIL_CURSOR_KEY) and an account's
+        # pending start (pending_cursor_key) must not pass to another mailbox:
+        # drop them when the auth mode changes or Save records a different
+        # mailbox for an account - except when an account saved untested ("")
+        # is now verified, which is what a pending start waits for. A legacy
+        # install (nothing recorded) that saves a verified mailbox drops the
+        # old cursor too; the next scan then starts from lookback_days, which
+        # re-lists mail but saves no duplicate files (job keys per account,
+        # kept 730 days).
         drop_pending_cursor = mode_changed
+        pending_drops = (
+            [account["email"] for account in get_account_configs(current) + accounts] if mode_changed else []
+        )
         for account, value in identity_writes.items():
             stored = q.get_metadata(identity_key(account))
             if value != stored and not (stored == "" and value):
                 drop_pending_cursor = True
+                pending_drops.append(account)
         return {
             "mode": mode,
             "values": values,
@@ -966,6 +976,7 @@ class SettingsDialog:
             "token": (staged or {}).get("creds"),
             "identity_writes": identity_writes,
             "drop_pending_cursor": drop_pending_cursor,
+            "pending_drops": pending_drops,
             "scan_start": scan_start,
         }
 
@@ -1383,7 +1394,7 @@ class TrayApp:
         q = queue()
         values = []
         for account in accounts:
-            raw = q.get_metadata(cursor_key(q, account["email"], dwd) or MAIL_CURSOR_KEY)
+            raw = q.get_metadata(cursor_key(q, account["email"], dwd) or pending_cursor_key(account["email"]))
             if raw is not None:
                 try:
                     values.append(float(raw))

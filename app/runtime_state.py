@@ -39,8 +39,9 @@ IDENTITY_KEY_PREFIX = "verified_identity:"
 # recorded for it (IDENTITY_KEY_PREFIX). Re-authenticating to another mailbox
 # therefore never inherits the previous mailbox's cursor; an alias of the same
 # mailbox keeps it. The bare key holds the OAuth cursor of versions before
-# this, or a start written while the OAuth account had no mailbox recorded
-# yet: the first scan of its recorded mailbox adopts and deletes it.
+# this; "mail_cursor_timestamp:pending:<account>" a start written while the
+# OAuth account had no mailbox recorded yet. The first scan of the recorded
+# mailbox takes over the bare key and the scanned account's pending key.
 MAIL_CURSOR_KEY = "mail_cursor_timestamp"
 # JSON {account: message} of attachment jobs deferred for authentication,
 # shown by the tray as 要確認; an account's entry is cleared when one of its
@@ -85,6 +86,10 @@ def settings_update_in_progress(queue, now=None):
 
 def identity_key(account_email):
     return IDENTITY_KEY_PREFIX + str(account_email or "").strip().lower()
+
+
+def pending_cursor_key(account_email):
+    return f"{MAIL_CURSOR_KEY}:pending:{str(account_email or '').strip().lower()}"
 
 
 def cursor_key(queue, account_email, dwd, identities=None):
