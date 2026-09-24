@@ -531,6 +531,26 @@ class MailboxCursorTest(SaveTestBase):
         self.assertAlmostEqual(chosen.timestamp(), self.first_scan(self.TARGET).timestamp(), delta=2)
         self.assertIsNone(self.cursor())
 
+    def test_rescan_for_a_new_untested_alias_is_honored_after_test_and_save(self):
+        # Mailbox m@ was checked an hour ago under alias a1@. The user types a
+        # new alias a2@ without a test, rescans from 10 days ago, then tests
+        # and saves a2@ -> m@: the first scan starts at the rescan date.
+        self.record("a1@example.com", "m@example.com", datetime.now() - timedelta(hours=1))
+        self.make_dialog(email="a2@example.com", final=self.final).save()
+        self.assertEqual("", self.identities()["a2@example.com"])
+        app = gmail_app.TrayApp.__new__(gmail_app.TrayApp)
+        app.controller = self.controller
+        chosen = datetime.now() - timedelta(days=10)
+        self.assertTrue(app.apply_scan_start(chosen))
+        gmail_app.messagebox.askyesno.return_value = True
+
+        self.login_dialog("a2@example.com", "m@example.com").save()
+
+        start = self.first_scan("a2@example.com")
+        self.assertAlmostEqual((chosen + timedelta(minutes=5)).timestamp(),
+                               (start + gmail_monitor.QUERY_OVERLAP).timestamp(), delta=2)
+        self.assertIsNone(self.cursor())
+
     def test_mailbox_change_with_a_period_writes_it_for_the_new_mailbox_only(self):
         checked = datetime.now() - timedelta(hours=1)
         self.record(self.TARGET, self.TARGET, checked)

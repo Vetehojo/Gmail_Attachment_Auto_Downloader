@@ -59,7 +59,6 @@ TRAY_LOCK_FILE = os.path.join(STATE_DIR, "app.lock")
 LOG_FILE = os.path.join(BASE_DIR, "log", "mail_log.txt")
 MONITOR_MUTEX_NAME = "Local\\GmailAutoDownloaderMonitor"
 TRAY_MUTEX_NAME = "Local\\GmailAutoDownloaderTray"
-MAIL_CURSOR_KEY = "mail_cursor_timestamp"
 RETENTION_KEY = "jobs_retention_last_run"
 LAST_ERROR_KEY = "monitor_last_error"
 WORKER_ERROR_KEY = "worker_last_error"
@@ -362,14 +361,17 @@ def scan_gmail(queue, service, account_email=None, final_dir=None, auth_mode=Non
         raise AuthenticationRequiredError(
             f"{account_email} のメールボックスが確認されていないため、取得を保留しています。"
         )
-    if mode != AUTH_DWD and queue.get_metadata(key) is None:
-        pending = queue.get_metadata(MAIL_CURSOR_KEY)
-        if pending is not None:
-            # An older version's OAuth cursor, or a start set before the
-            # mailbox was recorded: this mailbox takes it over, once.
-            queue.set_metadata(key, pending)
-            queue.delete_metadata(MAIL_CURSOR_KEY)
-            log(f"Adopted the pending OAuth mail cursor [{account_email}]: {key}", "scan")
+    if mode != AUTH_DWD and queue.get_metadata(MAIL_CURSOR_KEY) is not None:
+        # An older version's OAuth cursor, or a start set before the mailbox
+        # was recorded: this mailbox takes it over, once. The earlier of it
+        # and the mailbox's own cursor wins, so no mail is skipped (job keys
+        # keep a re-listed message from being saved twice).
+        pending = get_mail_cursor(queue, MAIL_CURSOR_KEY)
+        current = get_mail_cursor(queue, key)
+        if current is None or (pending is not None and pending < current):
+            queue.set_metadata(key, queue.get_metadata(MAIL_CURSOR_KEY))
+        queue.delete_metadata(MAIL_CURSOR_KEY)
+        log(f"Took over the pending OAuth mail cursor [{account_email}]: {key}", "scan")
     cursor = get_mail_cursor(queue, key)
     try:
         lookback_days = max(1, int(settings.get("lookback_days", "7")))

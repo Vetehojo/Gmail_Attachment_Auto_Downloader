@@ -294,6 +294,21 @@ class MonitorPaginationTest(unittest.TestCase):
         self.assertEqual(int((advanced - gmail_monitor.QUERY_OVERLAP).timestamp()), self.scan_start(queue))
         self.assertEqual([gmail_monitor.MAIL_CURSOR_KEY], queue.deleted_keys)
 
+    def test_pending_oauth_cursor_takeover_keeps_the_earlier_cursor(self):
+        older = datetime.now() - timedelta(days=5)
+        newer = datetime.now() - timedelta(hours=2)
+        for pending, own in ((older, newer), (newer, older)):
+            with self.subTest(pending=pending, own=own):
+                queue = verified_queue()
+                queue.metadata[gmail_monitor.MAIL_CURSOR_KEY] = str(pending.timestamp())
+                queue.metadata["mail_cursor_timestamp:a@example.com"] = str(own.timestamp())
+
+                start = self.scan_start(queue)
+
+                self.assertEqual(int((older - gmail_monitor.QUERY_OVERLAP).timestamp()), start)
+                self.assertNotIn(gmail_monitor.MAIL_CURSOR_KEY, queue.metadata)
+                self.assertEqual([gmail_monitor.MAIL_CURSOR_KEY], queue.deleted_keys)
+
     def test_dwd_scan_leaves_the_pending_oauth_cursor_alone(self):
         queue = FakeQueue()
         queue.metadata[gmail_monitor.MAIL_CURSOR_KEY] = str((datetime.now() - timedelta(hours=1)).timestamp())
