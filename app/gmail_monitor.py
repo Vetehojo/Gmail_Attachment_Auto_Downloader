@@ -38,11 +38,13 @@ from filename_rules import filename_budget, render_filename
 from gmail_auth import AccountNotConfiguredError, AuthenticationRequiredError, get_gmail_service
 from job_queue import JobQueue
 from runtime_state import (
+    MAIL_CURSOR_KEY,
     WORKER_HEARTBEAT_KEY,
     SingleInstance,
     append_log,
     atomic_write_json,
     clear_auth_issue,
+    cursor_key,
     identity_key,
     set_auth_issue,
     write_heartbeat,
@@ -101,15 +103,8 @@ def _account_id(account_email):
     return str(account_email or "").strip().lower()
 
 
-def cursor_key(account_email, auth_mode=None):
-    mode = normalize_auth_mode(auth_mode or load_settings().get("auth_mode"))
-    if mode == AUTH_DWD:
-        return f"{MAIL_CURSOR_KEY}:{_account_id(account_email)}"
-    return MAIL_CURSOR_KEY
-
-
-def get_mail_cursor(queue, account_email, auth_mode=None):
-    raw = queue.get_metadata(cursor_key(account_email, auth_mode))
+def get_mail_cursor(queue, key):
+    raw = queue.get_metadata(key)
     if raw is None:
         return None
     try:
@@ -360,7 +355,22 @@ def scan_gmail(queue, service, account_email=None, final_dir=None, auth_mode=Non
     allowed_extensions = load_allowed_extensions(settings)
 
     scan_started = datetime.now()
-    cursor = get_mail_cursor(queue, account_email, mode)
+    # One key for the whole scan: the cursor is read and advanced under it.
+    key = cursor_key(queue, account_email, mode == AUTH_DWD)
+    if key is None:
+        # ServicePool.get records or checks the OAuth mailbox before any scan.
+        raise AuthenticationRequiredError(
+            f"{account_email} のメールボックスが確認されていないため、取得を保留しています。"
+        )
+    if mode != AUTH_DWD and queue.get_metadata(key) is None:
+        pending = queue.get_metadata(MAIL_CURSOR_KEY)
+        if pending is not None:
+            # An older version's OAuth cursor, or a start set before the
+            # mailbox was recorded: this mailbox takes it over, once.
+            queue.set_metadata(key, pending)
+            queue.delete_metadata(MAIL_CURSOR_KEY)
+            log(f"Adopted the pending OAuth mail cursor [{account_email}]: {key}", "scan")
+    cursor = get_mail_cursor(queue, key)
     try:
         lookback_days = max(1, int(settings.get("lookback_days", "7")))
     except ValueError:
@@ -385,7 +395,7 @@ def scan_gmail(queue, service, account_email=None, final_dir=None, auth_mode=Non
             )
 
     # Advance only after pagination and all enqueue operations complete.
-    queue.set_metadata(cursor_key(account_email, mode), scan_started.timestamp())
+    queue.set_metadata(key, scan_started.timestamp())
     log(
         f"Scan complete [{account_email}]: messages={message_count}, "
         f"new_attachment_jobs={attachment_count}, start={start_time:%Y/%m/%d %H:%M:%S}",

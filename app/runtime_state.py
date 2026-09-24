@@ -34,6 +34,14 @@ SETTINGS_UPDATE_SECONDS = 120
 # before this check, trusted on first use. "": saved without a connection
 # test, refused until one is saved. Otherwise the verified address.
 IDENTITY_KEY_PREFIX = "verified_identity:"
+# Mail cursor per mailbox: "mail_cursor_timestamp:<address>", where a DWD
+# account's address is the typed one and an OAuth account's is the mailbox
+# recorded for it (IDENTITY_KEY_PREFIX). Re-authenticating to another mailbox
+# therefore never inherits the previous mailbox's cursor; an alias of the same
+# mailbox keeps it. The bare key holds the OAuth cursor of versions before
+# this, or a start written while the OAuth account had no mailbox recorded
+# yet: the first scan of its recorded mailbox adopts and deletes it.
+MAIL_CURSOR_KEY = "mail_cursor_timestamp"
 # JSON {account: message} of attachment jobs deferred for authentication,
 # shown by the tray as 要確認; an account's entry is cleared when one of its
 # jobs succeeds, and every entry when settings are saved.
@@ -77,6 +85,19 @@ def settings_update_in_progress(queue, now=None):
 
 def identity_key(account_email):
     return IDENTITY_KEY_PREFIX + str(account_email or "").strip().lower()
+
+
+def cursor_key(queue, account_email, dwd, identities=None):
+    """The account's mail cursor key (see MAIL_CURSOR_KEY); for OAuth None
+    while no mailbox is recorded for it. `identities` ({account: mailbox})
+    take precedence over the recorded ones."""
+    account = str(account_email or "").strip().lower()
+    if dwd:
+        return f"{MAIL_CURSOR_KEY}:{account}"
+    identities = identities or {}
+    mailbox = identities[account] if account in identities else queue.get_metadata(identity_key(account))
+    mailbox = str(mailbox or "").strip().lower()
+    return f"{MAIL_CURSOR_KEY}:{mailbox}" if mailbox else None
 
 
 def read_auth_issues(queue):

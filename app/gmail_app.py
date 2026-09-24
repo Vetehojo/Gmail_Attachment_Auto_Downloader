@@ -33,12 +33,14 @@ from filename_rules import preview_filename, validate_template
 from job_queue import JobQueue
 from runtime_state import (
     AUTH_ISSUES_KEY,
+    MAIL_CURSOR_KEY,
     WORKER_HEARTBEAT_KEY,
     WORKER_IDLE_STALL_SECONDS,
     WORKER_STALL_SECONDS,
     SingleInstance,
     append_log,
     begin_settings_update,
+    cursor_key,
     end_settings_update,
     format_auth_issues,
     identity_key,
@@ -54,7 +56,6 @@ HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
 APP_LOCK_FILE = os.path.join(STATE_DIR, "app.lock")
 TRAY_LOG = os.path.join(BASE_DIR, "log", "tray_log.txt")
 MONITOR_SCRIPT = os.path.join(SCRIPT_DIR, "gmail_monitor.py")
-MAIL_CURSOR_KEY = "mail_cursor_timestamp"
 PAUSED_KEY = "monitor_paused"
 # Why the monitor is paused: "exit" (set by exit_app) is cleared automatically
 # on the next start, "user" (set by toggle_pause) survives restarts/logon (I6).
@@ -89,29 +90,27 @@ def format_time(value):
         return "-"
 
 
-def cursor_key(email, mode):
-    if normalize_auth_mode(mode) == AUTH_DWD:
-        return f"{MAIL_CURSOR_KEY}:{str(email or '').strip().lower()}"
-    return MAIL_CURSOR_KEY
-
-
 def check_scan_start(start):
     if start > datetime.now():
         raise ValueError("未来の日付は指定できません。")
 
 
-def write_scan_start(q, start, settings):
+def write_scan_start(q, start, settings, identities=None):
     """Set every account's mail cursor in `settings` to just after `start`.
 
     lookback_days only bounds a cursor-less first scan (see gmail_monitor's
     scan_gmail). This always writes an explicit cursor for every account, so
     lookback_days is never consulted here; bumping it used to just leak a
     permanently larger window into later cursor-less scans for no benefit.
+
+    `identities` are mailboxes a Save is recording (see cursor_key). An OAuth
+    account with no mailbox recorded yet gets the pending MAIL_CURSOR_KEY,
+    which the first scan of its recorded mailbox adopts.
     """
-    mode = normalize_auth_mode(settings.get("auth_mode"))
+    dwd = normalize_auth_mode(settings.get("auth_mode")) == AUTH_DWD
     timestamp = (start + timedelta(minutes=5)).timestamp()
     for account in get_account_configs(settings):
-        q.set_metadata(cursor_key(account["email"], mode), timestamp)
+        q.set_metadata(cursor_key(q, account["email"], dwd, identities) or MAIL_CURSOR_KEY, timestamp)
 
 
 SAVED_LATER_TEXT = "設定はまだ保存していません。「保存」を押すと反映します。"
@@ -123,6 +122,25 @@ STOP_FAILED_TEXT = (
 START_FAILED_TEXT = (
     "ただし、自動取得（監視プロセス）を開始できませんでした。"
     "トレイアプリが定期的に開始を再試行します。「状態を表示」で状態を確認してください。"
+)
+PAUSE_STOP_FAILED_TEXT = (
+    "動作中の自動取得（監視プロセス）を特定できなかったか、停止できなかったため、一時停止しませんでした。"
+    "自動取得は動いたままの可能性があります。"
+    "詳しい原因は log\\tray_log.txt に記録しました。"
+)
+EXIT_STOP_FAILED_TEXT = (
+    "動作中の自動取得（監視プロセス）を特定できなかったか、停止できなかったため、"
+    "自動取得は動いたままの可能性があります。トレイアプリはこのまま終了します。"
+    "詳しい原因は log\\tray_log.txt に記録しました。"
+)
+RESCAN_STOP_FAILED_TEXT = (
+    "動作中の自動取得（監視プロセス）を特定できなかったか、停止できなかったため、再確認の期間を設定しませんでした。"
+    "自動取得は以前の確認位置から続けている可能性があります。"
+    "詳しい原因は log\\tray_log.txt に記録しました。"
+)
+RUN_NOW_FAILED_TEXT = (
+    "自動取得（監視プロセス）の停止または開始に失敗したため、Gmail確認を開始できませんでした。"
+    "「状態を表示」で状態を確認してください。停止に失敗した場合の原因は log\\tray_log.txt に記録しました。"
 )
 
 
@@ -265,12 +283,15 @@ def commit_settings(plan, q):
     if plan["token"] is not None:
         from gmail_auth import install_oauth_token
         install_oauth_token(plan["token"])
+    # Before the identities, so a new mailbox can never find it.
+    if plan["drop_pending_cursor"]:
+        q.delete_metadata(MAIL_CURSOR_KEY)
     for account, value in plan["identity_writes"].items():
         q.set_metadata(identity_key(account), value)
     # Deferrals recorded under the old settings; a job still failing re-records one.
     q.delete_metadata(AUTH_ISSUES_KEY)
     if plan["scan_start"] is not None:
-        write_scan_start(q, plan["scan_start"], plan["values"])
+        write_scan_start(q, plan["scan_start"], plan["values"], plan["identity_writes"])
     save_settings(plan["values"])
 
 
@@ -361,7 +382,7 @@ class MonitorController:
 
     def stop_all(self):
         """False when the monitor could not be confirmed stopped (cause logged).
-        Used by settings save, pause, exit and 今すぐGmailを確認."""
+        Used by settings save, pause, exit, 期間を指定して再確認 and 今すぐGmailを確認."""
         if os.name == "nt":
             try:
                 windows_integration.stop_owned_monitors(
@@ -915,15 +936,28 @@ class SettingsDialog:
             check_scan_start(scan_start)
         q = queue()
         current = load_settings()
+        mode_changed = normalize_auth_mode(current.get("auth_mode")) != mode
         # After an auth mode switch the credentials that will open each mailbox
         # are new, so no account keeps trust-on-first-use.
-        previous = get_account_configs(current) if normalize_auth_mode(current.get("auth_mode")) == mode else []
+        previous = [] if mode_changed else get_account_configs(current)
         identity_writes = plan_identity_writes(
             [account["email"] for account in accounts],
             [account["email"] for account in previous],
             (staged or {}).get("identities", {}),
             lambda account: q.get_metadata(identity_key(account)),
         )
+        # The pending OAuth cursor (MAIL_CURSOR_KEY) must not pass to another
+        # mailbox: drop it when the auth mode changes or Save records a
+        # different mailbox for an account - except when an account saved
+        # untested ("") is now verified, which is what it waits for. A legacy
+        # install (nothing recorded) that saves a verified mailbox drops it too;
+        # the next scan then starts from lookback_days, which re-lists mail
+        # but saves no duplicate files (job keys per account, kept 730 days).
+        drop_pending_cursor = mode_changed
+        for account, value in identity_writes.items():
+            stored = q.get_metadata(identity_key(account))
+            if value != stored and not (stored == "" and value):
+                drop_pending_cursor = True
         return {
             "mode": mode,
             "values": values,
@@ -931,6 +965,7 @@ class SettingsDialog:
             "create_dir": create_dir,
             "token": (staged or {}).get("creds"),
             "identity_writes": identity_writes,
+            "drop_pending_cursor": drop_pending_cursor,
             "scan_start": scan_start,
         }
 
@@ -1116,9 +1151,25 @@ class TrayApp:
             q.set_metadata(PAUSED_KEY, "0")
 
     def apply_scan_start(self, start):
+        """期間を指定して再確認: write every account's cursor while the monitor
+        is stopped. False, with nothing written, when it could not be
+        confirmed stopped. The settings-update marker keeps the watchdog and
+        the tray's health tick from starting it meanwhile."""
         check_scan_start(start)
-        self.controller.stop_all()
-        write_scan_start(queue(), start, load_settings())
+        q = queue()
+        begin_settings_update(q)
+        try:
+            if not self.controller.stop_all():
+                log("Rescan aborted: the monitor could not be stopped", "rescan")
+                return False
+            write_scan_start(q, start, load_settings())
+            return True
+        finally:
+            try:
+                end_settings_update(q)
+            except Exception as exc:
+                # It expires on its own after SETTINGS_UPDATE_SECONDS.
+                log(f"Settings update marker could not be cleared: {exc}", "rescan")
 
     @staticmethod
     def _make_icon(error=False):
@@ -1296,7 +1347,9 @@ class TrayApp:
                 "一時停止中です。トレイメニューの「一時停止 / 再開」で再開してから実行してください。",
             )
             return
-        self.controller.restart()
+        if not self.controller.restart():
+            messagebox.showerror("Gmail Attachment Downloader", RUN_NOW_FAILED_TEXT)
+            return
         messagebox.showinfo("Gmail Attachment Downloader", "Gmail確認を開始しました。")
 
     def toggle_pause(self):
@@ -1308,22 +1361,29 @@ class TrayApp:
             # silently resuming.
             q.delete_metadata(PAUSE_REASON_KEY)
             q.set_metadata(PAUSED_KEY, "0")
-            self.controller.start()
+            if not self.controller.start():
+                messagebox.showwarning("Gmail Attachment Downloader", f"自動取得を再開しました。\n{START_FAILED_TEXT}")
+                return
             messagebox.showinfo("Gmail Attachment Downloader", "自動取得を再開しました。")
         else:
             q.set_metadata(PAUSE_REASON_KEY, "user")
             q.set_metadata(PAUSED_KEY, "1")
-            self.controller.stop_all()
+            if not self.controller.stop_all():
+                # Not paused after all: the monitor may still be running.
+                q.delete_metadata(PAUSE_REASON_KEY)
+                q.set_metadata(PAUSED_KEY, "0")
+                messagebox.showerror("Gmail Attachment Downloader", PAUSE_STOP_FAILED_TEXT)
+                return
             messagebox.showinfo("Gmail Attachment Downloader", "自動取得を一時停止しました。")
 
     def _cursor_summary(self):
         settings = load_settings()
-        mode = normalize_auth_mode(settings.get("auth_mode"))
+        dwd = normalize_auth_mode(settings.get("auth_mode")) == AUTH_DWD
         accounts = get_account_configs(settings)
         q = queue()
         values = []
         for account in accounts:
-            raw = q.get_metadata(cursor_key(account["email"], mode))
+            raw = q.get_metadata(cursor_key(q, account["email"], dwd) or MAIL_CURSOR_KEY)
             if raw is not None:
                 try:
                     values.append(float(raw))
@@ -1624,17 +1684,22 @@ class TrayApp:
         def apply():
             try:
                 start = parse_scan_start(period.get(), custom.get())
-                self.apply_scan_start(start)
+                applied = self.apply_scan_start(start)
             except Exception as exc:
                 messagebox.showerror("期間エラー", str(exc), parent=win)
                 return
+            if not applied:
+                messagebox.showerror("再確認できませんでした", RESCAN_STOP_FAILED_TEXT, parent=win)
+                return
+            started = True
             if not self.paused():
-                self.controller.start()
+                started = self.controller.start()
             win.destroy()
-            messagebox.showinfo(
-                "再スキャン",
-                f"{start:%Y/%m/%d %H:%M} 以降を再確認します。\n同一メール・同一添付は重複登録されません。",
-            )
+            text = f"{start:%Y/%m/%d %H:%M} 以降を再確認します。\n同一メール・同一添付は重複登録されません。"
+            if started:
+                messagebox.showinfo("再スキャン", text)
+            else:
+                messagebox.showwarning("再スキャン", f"{text}\n{START_FAILED_TEXT}")
 
         bar = ttk.Frame(win)
         bar.grid(row=3, column=0, columnspan=3, sticky="e", padx=10, pady=10)
@@ -1688,7 +1753,10 @@ class TrayApp:
                 # instance (user pause) keeps its existing reason (I6).
                 q.set_metadata(PAUSE_REASON_KEY, "exit")
                 q.set_metadata(PAUSED_KEY, "1")
-            self.controller.stop_all()
+            # The exit pause stays either way, so the watchdog stays idle
+            # until the next start clears it.
+            if not self.controller.stop_all():
+                messagebox.showwarning("Gmail Attachment Downloader", EXIT_STOP_FAILED_TEXT)
         if self.tray is not None:
             try:
                 self.tray.stop()

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from unittest import mock
 
 import gmail_monitor
+from runtime_state import identity_key
 
 
 class FakeStopEvent:
@@ -108,6 +109,14 @@ def oauth_settings():
     }
 
 
+def verified_queue(mailbox="a@example.com"):
+    """FakeQueue with a@example.com's mailbox recorded, as ServicePool.get
+    leaves it before a scan."""
+    queue = FakeQueue()
+    queue.metadata[identity_key("a@example.com")] = mailbox
+    return queue
+
+
 def query_start_timestamp(query):
     match = re.search(r"after:(\d+)", query)
     if not match:
@@ -142,7 +151,7 @@ class MonitorPaginationTest(unittest.TestCase):
         self.assertEqual("page2", service.messages_api.calls[1]["pageToken"])
 
     def test_cursor_does_not_advance_when_enqueue_fails(self):
-        queue = FakeQueue()
+        queue = verified_queue()
         cursor = datetime.now() - timedelta(hours=1)
         with mock.patch.object(gmail_monitor, "load_settings", return_value=oauth_settings()), \
              mock.patch.object(gmail_monitor, "get_mail_cursor", return_value=cursor), \
@@ -153,7 +162,7 @@ class MonitorPaginationTest(unittest.TestCase):
         self.assertEqual([], queue.set_calls)
 
     def test_existing_cursor_is_not_clamped_by_lookback(self):
-        queue = FakeQueue()
+        queue = verified_queue()
         old_cursor = datetime.now() - timedelta(days=20)
         seen = {}
 
@@ -169,7 +178,7 @@ class MonitorPaginationTest(unittest.TestCase):
         self.assertEqual(expected_after, query_start_timestamp(seen["query"]))
 
     def test_initial_scan_uses_lookback_window(self):
-        queue = FakeQueue()
+        queue = verified_queue()
         seen = {}
 
         def ids(_service, query, _account):
@@ -205,7 +214,7 @@ class MonitorPaginationTest(unittest.TestCase):
         self.assertNotIn("-label:", gmail_monitor.build_mail_query(start, "a@example.com", "oauth", excluded_labels=[]))
 
     def test_scan_gmail_sources_excluded_labels_and_allowed_extensions_from_settings(self):
-        queue = FakeQueue()
+        queue = verified_queue()
         seen = {}
 
         def ids(_service, query, _account):
@@ -227,10 +236,86 @@ class MonitorPaginationTest(unittest.TestCase):
         self.assertIn('-label:"FAX"', seen["query"])
         self.assertEqual({".pdf"}, seen["allowed_extensions"])
 
-    def test_dwd_cursor_is_per_account(self):
-        self.assertEqual("mail_cursor_timestamp:a@example.com", gmail_monitor.cursor_key("A@example.com", "dwd"))
-        self.assertEqual("mail_cursor_timestamp:b@example.com", gmail_monitor.cursor_key("b@example.com", "dwd"))
-        self.assertEqual(gmail_monitor.MAIL_CURSOR_KEY, gmail_monitor.cursor_key("a@example.com", "oauth"))
+    def test_cursor_is_per_mailbox(self):
+        queue = FakeQueue()
+        self.assertEqual("mail_cursor_timestamp:a@example.com", gmail_monitor.cursor_key(queue, "A@example.com", True))
+        self.assertEqual("mail_cursor_timestamp:b@example.com", gmail_monitor.cursor_key(queue, "b@example.com", True))
+        # OAuth: the mailbox recorded for the account, not the typed address;
+        # none until one is recorded, and none for an untested account ("").
+        self.assertIsNone(gmail_monitor.cursor_key(queue, "info@example.com", False))
+        queue.metadata[identity_key("info@example.com")] = ""
+        self.assertIsNone(gmail_monitor.cursor_key(queue, "info@example.com", False))
+        queue.metadata[identity_key("info@example.com")] = "Owner@example.com"
+        self.assertEqual(
+            "mail_cursor_timestamp:owner@example.com", gmail_monitor.cursor_key(queue, "Info@example.com", False)
+        )
+        # A Save's own identity writes take precedence over the recorded ones.
+        self.assertEqual(
+            "mail_cursor_timestamp:b@example.com",
+            gmail_monitor.cursor_key(queue, "info@example.com", False, {"info@example.com": "b@example.com"}),
+        )
+
+    def scan_start(self, queue, settings=None):
+        """Run one scan of a@example.com that finds no mail; its query start."""
+        seen = {}
+
+        def ids(_service, query, _account):
+            seen["query"] = query
+            return iter([])
+
+        with mock.patch.object(gmail_monitor, "load_settings", return_value=settings or oauth_settings()), \
+             mock.patch.object(gmail_monitor, "iter_message_ids", side_effect=ids):
+            gmail_monitor.scan_gmail(queue, object(), account_email="a@example.com")
+        return query_start_timestamp(seen["query"])
+
+    def test_oauth_scan_reads_and_advances_the_recorded_mailbox_cursor(self):
+        queue = verified_queue("owner@example.com")
+        cursor = datetime.now() - timedelta(hours=3)
+        queue.metadata["mail_cursor_timestamp:owner@example.com"] = str(cursor.timestamp())
+        before = time.time()
+
+        start = self.scan_start(queue)
+
+        self.assertEqual(int((cursor - gmail_monitor.QUERY_OVERLAP).timestamp()), start)
+        self.assertEqual(["mail_cursor_timestamp:owner@example.com"], [key for key, _value in queue.set_calls])
+        self.assertGreaterEqual(float(queue.metadata["mail_cursor_timestamp:owner@example.com"]), before - 1)
+
+    def test_pending_oauth_cursor_is_adopted_once(self):
+        queue = verified_queue()
+        pending = datetime.now() - timedelta(days=2)
+        queue.metadata[gmail_monitor.MAIL_CURSOR_KEY] = str(pending.timestamp())
+
+        start = self.scan_start(queue)
+
+        self.assertEqual(int((pending - gmail_monitor.QUERY_OVERLAP).timestamp()), start)
+        self.assertNotIn(gmail_monitor.MAIL_CURSOR_KEY, queue.metadata)
+        advanced = datetime.fromtimestamp(float(queue.metadata["mail_cursor_timestamp:a@example.com"]))
+        # The next scan resumes from the mailbox's own cursor.
+        self.assertEqual(int((advanced - gmail_monitor.QUERY_OVERLAP).timestamp()), self.scan_start(queue))
+        self.assertEqual([gmail_monitor.MAIL_CURSOR_KEY], queue.deleted_keys)
+
+    def test_dwd_scan_leaves_the_pending_oauth_cursor_alone(self):
+        queue = FakeQueue()
+        queue.metadata[gmail_monitor.MAIL_CURSOR_KEY] = str((datetime.now() - timedelta(hours=1)).timestamp())
+        before = datetime.now()
+
+        start = self.scan_start(queue, {"auth_mode": "dwd", "lookback_days": "7"})
+
+        self.assertLessEqual(start, int((before - timedelta(days=7)).timestamp()) + 2)
+        self.assertIn(gmail_monitor.MAIL_CURSOR_KEY, queue.metadata)
+        self.assertEqual(["mail_cursor_timestamp:a@example.com"], [key for key, _value in queue.set_calls])
+
+    def test_oauth_scan_without_a_recorded_mailbox_touches_no_cursor(self):
+        for recorded in (None, ""):
+            with self.subTest(recorded=recorded):
+                queue = FakeQueue()
+                queue.metadata[gmail_monitor.MAIL_CURSOR_KEY] = "1700000000"
+                if recorded is not None:
+                    queue.metadata[identity_key("a@example.com")] = recorded
+                with self.assertRaises(gmail_monitor.AuthenticationRequiredError):
+                    self.scan_start(queue)
+                self.assertEqual([], queue.set_calls)
+                self.assertEqual([], queue.deleted_keys)
 
     def test_attachment_job_key_is_per_message_and_account(self):
         attachment = {"attachment_id": "att", "inline_data": "", "part_id": "1"}
@@ -395,7 +480,7 @@ class MonitorPaginationTest(unittest.TestCase):
 
         def fake_scan(q, service, account_email=None, final_dir=None, auth_mode=None):
             calls.append((service, account_email, final_dir, auth_mode))
-            q.set_metadata(gmail_monitor.cursor_key(account_email, auth_mode), 1000.0)
+            q.set_metadata(gmail_monitor.cursor_key(q, account_email, auth_mode == "dwd"), 1000.0)
             return {"account": account_email, "messages": 0, "attachments": 0}
 
         with mock.patch.object(gmail_monitor, "load_settings", return_value={"auth_mode": "dwd"}), \
@@ -425,7 +510,7 @@ class MonitorPaginationTest(unittest.TestCase):
         def fake_scan(q, service, account_email=None, final_dir=None, auth_mode=None):
             if account_email == "osaka@example.jp":
                 raise RuntimeError("mailbox unavailable")
-            q.set_metadata(gmail_monitor.cursor_key(account_email, auth_mode), 1000.0)
+            q.set_metadata(gmail_monitor.cursor_key(q, account_email, auth_mode == "dwd"), 1000.0)
             return {"account": account_email, "messages": 0, "attachments": 0}
 
         with mock.patch.object(gmail_monitor, "load_settings", return_value={"auth_mode": "dwd"}), \
