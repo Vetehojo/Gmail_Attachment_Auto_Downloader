@@ -217,7 +217,10 @@ class HeartbeatDoesNotStrandJobsTest(unittest.TestCase):
     def test_denied_heartbeat_replace_does_not_abort_a_scan(self):
         class MetadataQueue:
             def __init__(self):
-                self.metadata = {}
+                self.metadata = {runtime_state.identity_key("a@example.com"): "a@example.com"}
+
+            def get_metadata(self, key, default=None):
+                return self.metadata.get(key, default)
 
             def set_metadata(self, key, value):
                 self.metadata[key] = value
@@ -240,7 +243,7 @@ class HeartbeatDoesNotStrandJobsTest(unittest.TestCase):
                 result = gmail_monitor.scan_gmail(queue, object(), account_email="a@example.com", final_dir=td)
 
             self.assertEqual(10, result["messages"])
-            self.assertIn(gmail_monitor.MAIL_CURSOR_KEY, queue.metadata)
+            self.assertIn(f"{gmail_monitor.MAIL_CURSOR_KEY}:a@example.com", queue.metadata)
             self.assertFalse(os.path.exists(heartbeat + ".tmp"))
             self.assertEqual(1, len(log_lines(log_path, "Heartbeat write failed")))
 

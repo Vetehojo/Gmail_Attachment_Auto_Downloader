@@ -3,6 +3,7 @@
 the marker. Paths go to a temp folder; the monitor controller is a mock."""
 import contextlib
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -351,7 +352,8 @@ class SaveOrderTest(SaveTestBase):
         real = gmail_app.save_settings
 
         def save_settings(values):
-            cursors.append(self.queue.get_metadata(gmail_app.MAIL_CURSOR_KEY))
+            # No mailbox recorded for the account yet: its pending start.
+            cursors.append(self.queue.get_metadata(runtime_state.pending_cursor_key(self.TARGET)))
             return real(values)
 
         with mock.patch.object(gmail_app, "save_settings", side_effect=save_settings), \
@@ -402,6 +404,222 @@ class SaveOrderTest(SaveTestBase):
     def metadata(self):
         with contextlib.closing(sqlite3.connect(self.queue_db)) as conn:
             return conn.execute("SELECT key, value, updated_at FROM metadata ORDER BY key").fetchall()
+
+
+class MailboxCursorTest(SaveTestBase):
+    """OAuth mail cursors per recorded mailbox across Saves, rescans and scans
+    (runtime_state.MAIL_CURSOR_KEY). LiveStateTestBase is an older version's
+    install: OAuth a@example.com, no mailbox recorded, the bare cursor key."""
+
+    def setUp(self):
+        super().setUp()
+        for patcher in (mock.patch.object(gmail_monitor, "log"), mock.patch.object(gmail_monitor, "write_heartbeat")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def cursor(self, mailbox=None):
+        return self.queue.get_metadata(gmail_app.MAIL_CURSOR_KEY + (f":{mailbox}" if mailbox else ""))
+
+    def record(self, account, mailbox, checked=None):
+        """`account` scanned before: `mailbox` recorded, its cursor at `checked`."""
+        self.queue.delete_metadata(gmail_app.MAIL_CURSOR_KEY)
+        self.queue.set_metadata(runtime_state.identity_key(account), mailbox)
+        if checked is not None:
+            self.queue.set_metadata(f"{gmail_app.MAIL_CURSOR_KEY}:{mailbox}", checked.timestamp())
+
+    def first_scan(self, account):
+        """Where the next scan of `account` under the saved settings starts."""
+        seen = {}
+
+        def ids(_service, query, _account):
+            seen["query"] = query
+            return iter([])
+
+        with mock.patch.object(gmail_monitor, "iter_message_ids", side_effect=ids):
+            gmail_monitor.scan_gmail(self.queue, object(), account, self.final)
+        return datetime.fromtimestamp(int(re.search(r"after:(\d+)", seen["query"]).group(1)))
+
+    def login_dialog(self, email, mailbox, **values):
+        client = self.downloaded_client()
+        return self.make_dialog(
+            credentials=client, email=email, final=self.final, staged=self.staged_login(client, email, mailbox), **values
+        )
+
+    @staticmethod
+    def yesterday():
+        return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+
+    def test_mailbox_change_scans_the_new_mailbox_from_lookback_days(self):
+        # External review scenario: a@ was just checked, then the user logs in
+        # to mailbox b@ and saves. b@'s mail from yesterday must be in its
+        # first scan, not skipped by a@'s cursor.
+        self.record(self.TARGET, self.TARGET)
+        self.first_scan(self.TARGET)
+        checked = self.cursor(self.TARGET)
+
+        self.login_dialog("b@example.com", "b@example.com").save()
+
+        start = self.first_scan("b@example.com")
+        self.assertLessEqual(start, self.yesterday())
+        self.assertAlmostEqual((datetime.now() - timedelta(days=7)).timestamp(), start.timestamp(), delta=60)
+        self.assertIsNotNone(checked)
+        self.assertEqual(checked, self.cursor(self.TARGET))
+
+    def test_relogin_to_another_mailbox_does_not_inherit_an_older_versions_cursor(self):
+        # An older version kept a@'s cursor under the bare key; the typed
+        # address stays a@ while the login changes to mailbox b@.
+        self.record(self.TARGET, self.TARGET)
+        self.queue.set_metadata(gmail_app.MAIL_CURSOR_KEY, (datetime.now() - timedelta(hours=1)).timestamp())
+        gmail_app.messagebox.askyesno.return_value = True
+
+        self.login_dialog(self.TARGET, "b@example.com").save()
+
+        self.assertIsNone(self.cursor())
+        self.assertLessEqual(self.first_scan(self.TARGET), self.yesterday())
+        self.assertIsNotNone(self.cursor("b@example.com"))
+
+    def test_alias_of_the_same_mailbox_keeps_its_cursor(self):
+        checked = datetime.now() - timedelta(hours=1)
+        self.record(self.TARGET, "owner@example.com", checked)
+        gmail_app.messagebox.askyesno.return_value = True
+
+        self.login_dialog("info@example.com", "owner@example.com").save()
+
+        start = self.first_scan("info@example.com")
+        self.assertEqual(int((checked - gmail_monitor.QUERY_OVERLAP).timestamp()), int(start.timestamp()))
+
+    def test_auth_mode_round_trip_passes_no_cursor_to_another_mailbox(self):
+        # OAuth a@ recorded on first use but not scanned yet: its cursor is
+        # still the pending bare key. b@ was recorded before, so switching to
+        # DWD writes no identity and only the mode change drops the cursor.
+        self.queue.set_metadata(runtime_state.identity_key(self.TARGET), self.TARGET)
+        self.queue.set_metadata(runtime_state.identity_key("b@example.com"), "b@example.com")
+        self.make_dialog(auth_mode="dwd", dwd_accounts=[{"email": "b@example.com", "final_dir": self.final}]).save()
+        self.assertEqual("dwd", app_settings.load_settings()["auth_mode"])
+        self.assertEqual({self.TARGET: self.TARGET, "b@example.com": "b@example.com"}, self.identities())
+        self.assertIsNone(self.cursor())
+        # DWD checked the typed address b@; back in OAuth, b@ logs in to
+        # mailbox mailbox-b@ (b@ being its alias), which has no cursor yet.
+        self.queue.set_metadata(f"{gmail_app.MAIL_CURSOR_KEY}:b@example.com", time.time())
+        gmail_app.messagebox.askyesno.return_value = True
+
+        self.login_dialog("b@example.com", "mailbox-b@example.com").save()
+
+        self.assertIsNone(self.cursor())
+        start = self.first_scan("b@example.com")
+        self.assertAlmostEqual((datetime.now() - timedelta(days=7)).timestamp(), start.timestamp(), delta=60)
+
+    def test_untested_initial_period_waits_for_the_mailbox_verified_later(self):
+        with mock.patch.object(gmail_app, "is_configured", return_value=True):
+            self.make_dialog(initial=True, period="過去3日", email="new@example.com", final=self.final).save()
+        self.assertEqual({"new@example.com": ""}, self.identities())
+        chosen = datetime.now() - timedelta(days=3)
+
+        self.login_dialog("new@example.com", "new@example.com").save()
+
+        self.assertAlmostEqual(chosen.timestamp(), self.first_scan("new@example.com").timestamp(), delta=60)
+        self.assertIsNone(self.cursor())
+        self.assertIsNone(self.cursor("pending:new@example.com"))
+
+    def test_rescan_before_an_older_installs_first_scan_is_kept_through_first_use(self):
+        app = gmail_app.TrayApp.__new__(gmail_app.TrayApp)
+        app.controller = self.controller
+        chosen = datetime.now() - timedelta(days=20)
+        # The older version checked until an hour ago.
+        self.queue.set_metadata(gmail_app.MAIL_CURSOR_KEY, (datetime.now() - timedelta(hours=1)).timestamp())
+
+        self.assertTrue(app.apply_scan_start(chosen))
+        gmail_monitor.verify_mailbox_identity(self.queue, self.TARGET, ProfileService(self.TARGET))
+
+        self.assertEqual([("stop_all", True)], self.events)
+        self.assertAlmostEqual(chosen.timestamp(), self.first_scan(self.TARGET).timestamp(), delta=2)
+        self.assertIsNone(self.cursor())
+        self.assertIsNone(self.cursor("pending:" + self.TARGET))
+
+    def test_rescan_for_a_new_untested_alias_is_honored_after_test_and_save(self):
+        # Mailbox m@ was checked an hour ago under alias a1@. The user types a
+        # new alias a2@ without a test, rescans from 10 days ago, then tests
+        # and saves a2@ -> m@: the first scan starts at the rescan date.
+        self.record("a1@example.com", "m@example.com", datetime.now() - timedelta(hours=1))
+        self.make_dialog(email="a2@example.com", final=self.final).save()
+        self.assertEqual("", self.identities()["a2@example.com"])
+        app = gmail_app.TrayApp.__new__(gmail_app.TrayApp)
+        app.controller = self.controller
+        chosen = datetime.now() - timedelta(days=10)
+        self.assertTrue(app.apply_scan_start(chosen))
+        gmail_app.messagebox.askyesno.return_value = True
+
+        self.login_dialog("a2@example.com", "m@example.com").save()
+
+        start = self.first_scan("a2@example.com")
+        self.assertAlmostEqual((chosen + timedelta(minutes=5)).timestamp(),
+                               (start + gmail_monitor.QUERY_OVERLAP).timestamp(), delta=2)
+        self.assertIsNone(self.cursor("pending:a2@example.com"))
+
+    def test_another_accounts_pending_start_is_not_taken_over(self):
+        # External review scenario: b@ was used before (mailbox recorded, not
+        # scanned yet). The current untested account a2@ rescans from 1 day
+        # ago; the user switches back to b@ and saves without a test. b@'s
+        # first scan must reach lookback_days, not a2@'s start.
+        self.record("b@example.com", "b@example.com")
+        self.make_dialog(email="a2@example.com", final=self.final).save()
+        app = gmail_app.TrayApp.__new__(gmail_app.TrayApp)
+        app.controller = self.controller
+        self.assertTrue(app.apply_scan_start(datetime.now() - timedelta(days=1)))
+        self.assertIsNotNone(self.cursor("pending:a2@example.com"))
+
+        self.make_dialog(email="b@example.com", final=self.final).save()
+
+        self.assertEqual({"a2@example.com": "", "b@example.com": "b@example.com"}, self.identities())
+        start = self.first_scan("b@example.com")
+        self.assertAlmostEqual((datetime.now() - timedelta(days=7)).timestamp(), start.timestamp(), delta=60)
+
+    def test_mailbox_change_with_a_period_writes_it_for_the_new_mailbox_only(self):
+        checked = datetime.now() - timedelta(hours=1)
+        self.record(self.TARGET, self.TARGET, checked)
+        gmail_app.messagebox.askyesno.return_value = True
+
+        with mock.patch.object(gmail_app, "is_configured", return_value=True):
+            self.login_dialog(self.TARGET, "b@example.com", initial=True, period="過去30日").save()
+
+        expected = (datetime.now() - timedelta(days=30) + timedelta(minutes=5)).timestamp()
+        self.assertAlmostEqual(expected, float(self.cursor("b@example.com")), delta=60)
+        self.assertEqual(str(checked.timestamp()), self.cursor(self.TARGET))
+        self.assertIsNone(self.cursor())
+
+    def test_rescan_and_status_use_the_recorded_mailbox_cursor(self):
+        summary = gmail_app.TrayApp.__new__(gmail_app.TrayApp)._cursor_summary
+        # Nothing recorded yet: the account's pending start, once one is set.
+        self.assertEqual("未確認（0/1アカウント）", summary())
+        gmail_app.write_scan_start(self.queue, datetime.now() - timedelta(days=5), app_settings.load_settings())
+        self.assertIn("確認済み 1/1アカウント", summary())
+        self.queue.set_metadata(runtime_state.identity_key(self.TARGET), "owner@example.com")
+        self.assertEqual("未確認（0/1アカウント）", summary())
+        chosen = datetime.now() - timedelta(days=2)
+
+        gmail_app.write_scan_start(self.queue, chosen, app_settings.load_settings())
+
+        expected = (chosen + timedelta(minutes=5)).timestamp()
+        self.assertAlmostEqual(expected, float(self.cursor("owner@example.com")), delta=1)
+        self.assertEqual("1700000000", self.cursor())
+        self.assertIn(gmail_app.format_time(expected), summary())
+
+    def test_dwd_cursors_stay_per_typed_address(self):
+        app_settings.save_settings({
+            "auth_mode": "dwd",
+            "dwd_accounts": app_settings.encode_dwd_accounts([
+                {"email": "x@example.com", "final_dir": self.final},
+                {"email": "y@example.com", "final_dir": self.final},
+            ]),
+        })
+        self.queue.set_metadata(runtime_state.identity_key("x@example.com"), "other@example.com")
+
+        gmail_app.write_scan_start(self.queue, datetime.now() - timedelta(days=2), app_settings.load_settings())
+
+        self.assertIsNotNone(self.cursor("x@example.com"))
+        self.assertIsNotNone(self.cursor("y@example.com"))
+        self.assertIsNone(self.cursor("other@example.com"))
+        self.assertIn("確認済み 2/2アカウント", gmail_app.TrayApp.__new__(gmail_app.TrayApp)._cursor_summary())
 
 
 class IdentityMismatchTest(unittest.TestCase):
