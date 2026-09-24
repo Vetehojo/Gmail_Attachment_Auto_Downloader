@@ -835,8 +835,13 @@ class TaskTransactionTest(unittest.TestCase):
             spec["executable"] = r"C:\Program Files (x86)\日本語 & Co\pythonw.exe"
             spec["script"] = spec["script"].replace(r"C:\App", r"C:\O'Brien & <Co> 作業")
         runner = StatefulTaskRunner()
-        register(runner, specs)
-        self.assert_verified(runner, specs)
+        # simulate_readback() models schtasks piping back cp932 bytes; pin the
+        # Japanese locale it assumes so the kanji paths round-trip
+        # deterministically on any machine/CI (see
+        # test_decodes_cp932_on_japanese_locale_preferred_encoding above).
+        with mock.patch.object(win.locale, "getpreferredencoding", return_value="cp932"):
+            register(runner, specs)
+            self.assert_verified(runner, specs)
 
     def test_rollback_refuses_to_overwrite_concurrent_foreign_replacement(self):
         specs = self.specs()
