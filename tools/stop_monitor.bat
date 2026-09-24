@@ -7,13 +7,15 @@ echo Gmail Monitor - Stop Process Tree
 echo ========================================
 echo.
 
-set "MONITOR_PY=%~dp0gmail_monitor.py"
-set "INTEGRATION_PY=%~dp0windows_integration.py"
+set "MONITOR_PY=%~dp0..\app\gmail_monitor.py"
+set "INTEGRATION_PY=%~dp0..\app\windows_integration.py"
 if not exist "%MONITOR_PY%" goto :END_ERROR
 if not exist "%INTEGRATION_PY%" goto :END_ERROR
 
 python "%INTEGRATION_PY%" stop-monitor --script "%MONITOR_PY%"
-if errorlevel 1 goto :END_ERROR
+rem Any exit code but 0 is a failure: a Ctrl+C or crash exit code can be
+rem negative, which "if errorlevel 1" would treat as success.
+if not "%ERRORLEVEL%"=="0" goto :END_ERROR
 
 echo.
 echo Gmail monitor process tree stopped.

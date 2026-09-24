@@ -1,7 +1,8 @@
 """Watchdog for Gmail Auto Downloader.
 
-Scheduled every five minutes. It supervises the monitor process and the
-separate heartbeat file. It does not use the Gmail mail cursor as health data.
+Scheduled every five minutes. It supervises the monitor process, the
+separate heartbeat file and the attachment worker's heartbeat in the queue.
+It does not use the Gmail mail cursor as health data.
 """
 import json
 import os
@@ -11,14 +12,20 @@ import time
 
 import app_settings
 from job_queue import JobQueue
-from runtime_state import append_log, read_heartbeat
+from runtime_state import (
+    WORKER_HEARTBEAT_KEY,
+    WORKER_STALL_SECONDS,
+    append_log,
+    read_heartbeat,
+    settings_update_in_progress,
+)
 import windows_integration
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_DIR = os.path.join(SCRIPT_DIR, "state")
+STATE_DIR = os.path.join(app_settings.BASE_DIR, "state")
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat.json")
-WATCHDOG_LOG = os.path.join(SCRIPT_DIR, "log", "watchdog_log.txt")
+WATCHDOG_LOG = os.path.join(app_settings.BASE_DIR, "log", "watchdog_log.txt")
 STATE_FILE = os.path.join(STATE_DIR, "watchdog_state.json")
 QUEUE_DB = os.path.join(STATE_DIR, "jobs.sqlite3")
 MONITOR_SCRIPT = os.path.join(SCRIPT_DIR, "gmail_monitor.py")
@@ -31,6 +38,14 @@ RESUME_GAP_SECONDS = 10 * 60
 RESUME_GRACE_SECONDS = 10 * 60
 MAX_RESTARTS = 3
 RESTART_WINDOW_SECONDS = 30 * 60
+# Consecutive checks (5 minutes apart) that must see the worker heartbeat
+# older than WORKER_STALL_SECONDS before the monitor is restarted.
+WORKER_STALL_CHECKS = 2
+# watchdog_state.json: whether this incident already produced a customer
+# notice (the !監視停止 file) / a restart-cap alert. Cleared once the monitor is
+# seen healthy again, or paused.
+NOTICE_SENT_KEY = "customer_notice_sent"
+CAP_ALERTED_KEY = "restart_cap_alerted"
 
 
 def log_event(message):
@@ -66,6 +81,21 @@ def _write_customer_notice(message):
                 handle.write(f"[{stamp}] {message}\n")
         except OSError:
             pass
+
+
+def claim_customer_notice(state):
+    """True for the first customer notice of an incident: later alerts of the
+    same incident still go to the log, msg and the event log, but add no line
+    to the !監視停止 files."""
+    if state.get(NOTICE_SENT_KEY):
+        return False
+    state[NOTICE_SENT_KEY] = True
+    return True
+
+
+def end_incident(state):
+    state.pop(NOTICE_SENT_KEY, None)
+    state.pop(CAP_ALERTED_KEY, None)
 
 
 def notify(message, customer_alert=False):
@@ -113,6 +143,52 @@ def is_paused():
         return False
 
 
+def worker_stall(now):
+    """Age text when attachment jobs are waiting or processing while the
+    worker heartbeat is missing or older than WORKER_STALL_SECONDS, else "".
+    The heartbeat.json the scanner keeps fresh says nothing about the worker."""
+    try:
+        queue = JobQueue(QUEUE_DB)
+        counts = queue.counts()
+        if not counts["pending"] and not counts["processing"]:
+            return ""
+        raw = queue.get_metadata(WORKER_HEARTBEAT_KEY)
+    except Exception as exc:
+        log_event(f"Failed to read the attachment worker state: {exc}")
+        return ""
+    try:
+        age = now - float(raw)
+    except (TypeError, ValueError):
+        return "missing"
+    return f"{int(age / 60)} min old" if age >= WORKER_STALL_SECONDS else ""
+
+
+def release_stalled_jobs(reason):
+    """After a stall kill: the killed attempt of each processing job counts
+    (JobQueue.fail_stalled_jobs), so a job that hangs on every try ends as a
+    visible failure instead of being retried forever."""
+    try:
+        outcomes = JobQueue(QUEUE_DB).fail_stalled_jobs(
+            "添付の保存処理が応答しなくなったため、監視プロセスを再起動して中断しました。"
+        )
+    except Exception as exc:
+        log_event(f"Failed to record the stalled attachment job attempt: {exc}")
+        return
+    if outcomes:
+        log_event("Stalled attachment job attempt recorded: " + ", ".join(
+            f"job {job_id} {outcome}" for job_id, outcome in sorted(outcomes.items())
+        ))
+
+
+def is_settings_update():
+    """The settings dialog is stopping the monitor to commit new settings."""
+    try:
+        return settings_update_in_progress(JobQueue(QUEUE_DB))
+    except Exception as exc:
+        log_event(f"Failed to read settings update state: {exc}")
+        return False
+
+
 def powershell(script):
     result = _run_hidden(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
@@ -153,6 +229,11 @@ def stop_monitor():
     except windows_integration.IntegrationError as exc:
         log_event(f"Monitor stop identity check failed: {exc}")
         return False
+    except OSError as exc:
+        # e.g. PowerShell or taskkill could not be run: a failed stop, so the
+        # caller aborts the restart and main() still saves its state file.
+        log_event(f"Monitor stop failed: {exc}")
+        return False
 
 
 def start_monitor():
@@ -167,7 +248,7 @@ def start_monitor():
             return False
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(
-        [sys.executable, MONITOR_SCRIPT], cwd=SCRIPT_DIR,
+        [sys.executable, MONITOR_SCRIPT], cwd=app_settings.BASE_DIR,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=creationflags,
     )
@@ -187,25 +268,32 @@ def can_restart(state, now):
     return len(times) < MAX_RESTARTS
 
 
-def perform_restart(state, reason, now, kill_existing=False):
-    if is_paused():
+def perform_restart(state, reason, now, kill_existing=False, worker_stalled=False):
+    """worker_stalled: the kill interrupts a hung attachment job, whose
+    attempt then counts (release_stalled_jobs)."""
+    if is_paused() or is_settings_update():
         state["stale_count"] = 0
         return
     if not can_restart(state, now):
         message = f"Gmail monitor restart suppressed: {MAX_RESTARTS} restarts within 30 minutes. Reason: {reason}"
         log_event(message)
-        notify(message, customer_alert=True)
-        event_log(message)
+        # This repeats every run until the window allows a restart again.
+        if not state.get(CAP_ALERTED_KEY):
+            state[CAP_ALERTED_KEY] = True
+            notify(message, customer_alert=claim_customer_notice(state))
+            event_log(message)
         state["stale_count"] = 0
         return
     if kill_existing:
         if not stop_monitor():
             message = f"Gmail monitor restart aborted because process ownership could not be verified. Reason: {reason}"
             log_event(message)
-            notify(message, customer_alert=True)
+            notify(message, customer_alert=claim_customer_notice(state))
             event_log(message)
             state["stale_count"] = 0
             return
+        if worker_stalled:
+            release_stalled_jobs(reason)
     log_event(f"Restarting Gmail monitor. Reason: {reason}")
     ok = start_monitor()
     state.setdefault("restart_times", []).append(now)
@@ -216,8 +304,29 @@ def perform_restart(state, reason, now, kill_existing=False):
     else:
         message = f"Gmail monitor restart FAILED. Reason: {reason}"
         log_event(message)
-        notify(message, customer_alert=True)
+        notify(message, customer_alert=claim_customer_notice(state))
         event_log(message)
+
+
+def check_worker(state, now, worker_checks):
+    """The monitor process and heartbeat.json look fine; is its attachment
+    worker stuck? worker_checks: consecutive stalled checks before this one."""
+    age_text = worker_stall(now)
+    if not age_text:
+        end_incident(state)
+        return
+    count = worker_checks + 1
+    if count < WORKER_STALL_CHECKS:
+        state["worker_stall_count"] = count
+        log_event(
+            f"Attachment worker heartbeat is {age_text} while jobs are waiting; "
+            f"observation {count}/{WORKER_STALL_CHECKS}."
+        )
+        return
+    perform_restart(
+        state, f"attachment worker stalled (heartbeat {age_text})", now,
+        kill_existing=True, worker_stalled=True,
+    )
 
 
 def main():
@@ -225,13 +334,23 @@ def main():
     state = load_state()
     previous_run = float(state.get("last_run", 0) or 0)
     state["last_run"] = now
+    # Kept only by a run that saw the worker stalled; any other outcome of
+    # this run starts the count again.
+    worker_checks = int(state.pop("worker_stall_count", 0) or 0)
 
     if is_paused():
         state["stale_count"] = 0
         state["paused"] = True
+        end_incident(state)
         save_state(state)
         return 0
     state.pop("paused", None)
+
+    # A Save stops the monitor on purpose and restarts it itself.
+    if is_settings_update():
+        state["stale_count"] = 0
+        save_state(state)
+        return 0
 
     if previous_run and now - previous_run > RESUME_GAP_SECONDS:
         state["grace_until"] = now + RESUME_GRACE_SECONDS
@@ -277,6 +396,8 @@ def main():
     stale = heartbeat_ts is None or now - heartbeat_ts >= STALE_SECONDS
     if not stale:
         state["stale_count"] = 0
+        # The scanner keeps heartbeat.json fresh on its own; check the worker too.
+        check_worker(state, now, worker_checks)
         save_state(state)
         return 0
 
@@ -289,7 +410,7 @@ def main():
     elif count == 2:
         message = f"Gmail monitor may be stalled: heartbeat is {age_text} (2/3)."
         log_event(message)
-        notify(message, customer_alert=True)
+        notify(message, customer_alert=claim_customer_notice(state))
     else:
         perform_restart(state, f"heartbeat remained stale ({age_text}) for 3 checks", now, kill_existing=True)
 

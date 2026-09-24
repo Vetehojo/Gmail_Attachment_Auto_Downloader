@@ -4,6 +4,13 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
+RETRY_DELAYS = (60, 300, 900, 1800, 3600, 7200)
+
+
+def _retry_delay(attempts, retry_delays):
+    index = min(max(attempts - 1, 0), len(retry_delays) - 1)
+    return float(retry_delays[index]) if retry_delays else 60.0
+
 
 class JobQueue:
     """Durable SQLite queue for Gmail attachment download jobs."""
@@ -97,6 +104,26 @@ class JobQueue:
             claimed = conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
             return self._row_to_job(claimed)
 
+    def claim_job(self, job_id, now=None):
+        """claim_next for one given job, with the same guards: it must be
+        pending, not ignored and due (next_attempt_at <= now). Returns None
+        when the job is not claimable."""
+        now = time.time() if now is None else float(now)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'processing', attempts = attempts + 1, updated_at = ?
+                WHERE id = ? AND status = 'pending' AND ignored = 0 AND next_attempt_at <= ?
+                """,
+                (now, int(job_id), now),
+            )
+            if cur.rowcount != 1:
+                return None
+            claimed = conn.execute("SELECT * FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+            return self._row_to_job(claimed)
+
     def mark_success(self, job_id, result=None):
         """Mark only an active, non-ignored job successful."""
         now = time.time()
@@ -113,7 +140,7 @@ class JobQueue:
             )
             return cur.rowcount == 1
 
-    def mark_failure(self, job_id, error, retry_delays=(60, 300, 900, 1800, 3600, 7200)):
+    def mark_failure(self, job_id, error, retry_delays=RETRY_DELAYS):
         now = time.time()
         with self._connect() as conn:
             row = conn.execute(
@@ -135,8 +162,7 @@ class JobQueue:
                 )
                 return "failed"
 
-            index = min(max(attempts - 1, 0), len(retry_delays) - 1)
-            delay = float(retry_delays[index]) if retry_delays else 60.0
+            delay = _retry_delay(attempts, retry_delays)
             conn.execute(
                 """
                 UPDATE jobs
@@ -146,6 +172,53 @@ class JobQueue:
                 (now + delay, str(error)[:4000], now, int(job_id)),
             )
             return "retry"
+
+    def fail_stalled_jobs(self, error, retry_delays=RETRY_DELAYS):
+        """Release every processing job of a monitor that was killed because its
+        worker stalled. Unlike recover_processing_jobs the claim counts as an
+        attempt (as in mark_failure), so a job that hangs on every try ends as
+        a visible failure. Returns {job_id: "retry" | "failed"}."""
+        now = time.time()
+        outcomes = {}
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT id, attempts, max_attempts FROM jobs WHERE status = 'processing' AND ignored = 0"
+            ).fetchall()
+            for row in rows:
+                job_id = int(row["id"])
+                attempts = int(row["attempts"])
+                if attempts >= int(row["max_attempts"]):
+                    conn.execute(
+                        "UPDATE jobs SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
+                        (str(error)[:4000], now, job_id),
+                    )
+                    outcomes[job_id] = "failed"
+                else:
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'pending', next_attempt_at = ?, last_error = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now + _retry_delay(attempts, retry_delays), str(error)[:4000], now, job_id),
+                    )
+                    outcomes[job_id] = "retry"
+        return outcomes
+
+    def fail_job(self, job_id, error):
+        """Fail a claimed job now, whatever attempts remain (it can never succeed as is)."""
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed', last_error = ?, updated_at = ?
+                WHERE id = ? AND status = 'processing' AND ignored = 0
+                """,
+                (str(error)[:4000], now, int(job_id)),
+            )
+            return cur.rowcount == 1
 
     def defer_job(self, job_id, error, delay=900):
         """Retry later without consuming an attempt (authentication/config outage)."""
@@ -240,6 +313,16 @@ class JobQueue:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
         return self._row_to_job(row)
+
+    def get_job_by_key(self, job_key):
+        """Like get_job, plus "result": the recorded save result of a success
+        (None when there is none, e.g. after retention compaction)."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE job_key = ?", (job_key,)).fetchone()
+        job = self._row_to_job(row)
+        if job is not None:
+            job["result"] = json.loads(row["result_json"]) if row["result_json"] else None
+        return job
 
     def recover_processing_jobs(self):
         """Processing rows are stale after a monitor restart; the claim itself is not an attempt."""

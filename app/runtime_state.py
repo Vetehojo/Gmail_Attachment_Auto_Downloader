@@ -23,6 +23,97 @@ _JSON_WRITE_LOCK = threading.Lock()
 _HEARTBEAT_FAILING = set()
 _HEARTBEAT_STATE_LOCK = threading.Lock()
 
+# Queue metadata shared by the tray, the monitor and the watchdog.
+# Set by the settings dialog's Save while it stops the monitor and commits the
+# new settings: an expiry timestamp, so a tray that dies mid-save cannot block
+# monitor starts for longer than SETTINGS_UPDATE_SECONDS.
+SETTINGS_UPDATE_KEY = "settings_update_until"
+SETTINGS_UPDATE_SECONDS = 120
+# Per-account mailbox identity (users.getProfile emailAddress) the monitor
+# compares every newly built Gmail service against. Absent: an install from
+# before this check, trusted on first use. "": saved without a connection
+# test, refused until one is saved. Otherwise the verified address.
+IDENTITY_KEY_PREFIX = "verified_identity:"
+# JSON {account: message} of attachment jobs deferred for authentication,
+# shown by the tray as 要確認; an account's entry is cleared when one of its
+# jobs succeeds, and every entry when settings are saved.
+AUTH_ISSUES_KEY = "monitor_auth_issues"
+# Time of the monitor's attachment worker's last sign of life: the monitor
+# start, its idle loop (gmail_monitor.WORKER_HEARTBEAT_INTERVAL) and each step
+# of a job (claimed, fetched, placed, verified). Nothing is written while one
+# download is in progress, so while a job is processing it may legitimately be
+# as old as one attachment download (up to 100MB) takes: WORKER_STALL_SECONDS.
+# With jobs only waiting, the idle loop keeps it within WORKER_IDLE_STALL_SECONDS.
+# The tray warns past these; the watchdog restarts the monitor when jobs wait
+# or process and it stays older than WORKER_STALL_SECONDS.
+WORKER_HEARTBEAT_KEY = "worker_heartbeat"
+WORKER_STALL_SECONDS = 15 * 60
+WORKER_IDLE_STALL_SECONDS = 300
+
+
+def begin_settings_update(queue, now=None):
+    now = time.time() if now is None else float(now)
+    queue.set_metadata(SETTINGS_UPDATE_KEY, now + SETTINGS_UPDATE_SECONDS)
+
+
+def end_settings_update(queue):
+    queue.delete_metadata(SETTINGS_UPDATE_KEY)
+
+
+def settings_update_in_progress(queue, now=None):
+    """True while a Save holds the marker and it has not expired. A value
+    further ahead than SETTINGS_UPDATE_SECONDS (e.g. the clock moved back)
+    counts as expired rather than blocking starts indefinitely."""
+    now = time.time() if now is None else float(now)
+    raw = queue.get_metadata(SETTINGS_UPDATE_KEY)
+    if raw is None:
+        return False
+    try:
+        remaining = float(raw) - now
+    except (TypeError, ValueError):
+        return False
+    return 0 < remaining <= SETTINGS_UPDATE_SECONDS
+
+
+def identity_key(account_email):
+    return IDENTITY_KEY_PREFIX + str(account_email or "").strip().lower()
+
+
+def read_auth_issues(queue):
+    raw = queue.get_metadata(AUTH_ISSUES_KEY)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {"": raw}
+    return data if isinstance(data, dict) else {"": raw}
+
+
+def set_auth_issue(queue, account, message):
+    issues = read_auth_issues(queue)
+    issues[account] = str(message)[:1000]
+    queue.set_metadata(AUTH_ISSUES_KEY, json.dumps(issues, ensure_ascii=False))
+
+
+def clear_auth_issue(queue, account):
+    """No write at all when the account has no entry."""
+    issues = read_auth_issues(queue)
+    if account not in issues:
+        return
+    del issues[account]
+    if issues:
+        queue.set_metadata(AUTH_ISSUES_KEY, json.dumps(issues, ensure_ascii=False))
+    else:
+        queue.delete_metadata(AUTH_ISSUES_KEY)
+
+
+def format_auth_issues(issues):
+    return " / ".join(
+        f"{account}: {message}" if account else str(message)
+        for account, message in sorted(issues.items())
+    )
+
 
 class SingleInstance:
     def __init__(self, name, lock_path):

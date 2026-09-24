@@ -2,9 +2,10 @@
 setlocal
 chcp 65001 >nul
 
-set "APP_PY=%~dp0gmail_app.py"
-set "WATCHDOG_PY=%~dp0watchdog.py"
-set "INTEGRATION_PY=%~dp0windows_integration.py"
+set "APP_PY=%~dp0app\gmail_app.py"
+set "WATCHDOG_PY=%~dp0app\watchdog.py"
+set "INTEGRATION_PY=%~dp0app\windows_integration.py"
+set "SCHTASKS=%SystemRoot%\System32\schtasks.exe"
 set "TASK_USER=%USERDOMAIN%\%USERNAME%"
 
 for /f "usebackq delims=" %%p in (`python -X utf8 -c "import os,sys; print(os.path.join(os.path.dirname(sys.executable),'pythonw.exe'))"`) do set "PYTHONW=%%p"
@@ -26,12 +27,30 @@ python "%INTEGRATION_PY%" register-tasks ^
     --app-script "%APP_PY%" ^
     --watchdog-script "%WATCHDOG_PY%" ^
     --user "%TASK_USER%"
-if errorlevel 1 goto :END_ERROR
+rem Any exit code but 0 is a failure: a Ctrl+C exit code is negative,
+rem which "if errorlevel 1" would treat as success.
+if not "%ERRORLEVEL%"=="0" goto :END_ERROR
 
 echo.
 echo Registered:
 echo   Gmail Auto Downloader Monitor  - tray app one minute after logon
 echo   Gmail Auto Downloader Watchdog - monitor recovery every five minutes
+echo.
+
+rem Start the tray now by running the task just registered. The task runs
+rem with least privilege (RunLevel LeastPrivilege in the task XML) in this
+rem user's session with the exact registered command line, even when this
+rem window runs as administrator.
+"%SCHTASKS%" /Run /TN "Gmail Auto Downloader Monitor" >nul
+if errorlevel 1 (
+    echo The tray app could not be started now. It starts at the next logon.
+    goto :END_OK
+)
+echo Started the tray app. It fetches automatically unless it is paused
+echo or the settings are not complete yet.
+echo If the tray app was already running, that instance keeps running.
+
+:END_OK
 echo.
 pause
 exit /b 0
@@ -46,6 +65,11 @@ goto :END_ERROR
 echo.
 echo [ERROR] Failed to register scheduled tasks.
 echo Existing tasks were left untouched unless their executable and script matched this install.
-echo Any partial update was rolled back and verified where possible.
+echo If registration reported an error, any partial update was rolled back and verified where possible.
+echo If this window was interrupted, for example with Ctrl+C, the tasks may be only partly updated.
+echo Run this file again to finish or repair the registration.
+echo When upgrading from the old layout, exit the tray app and delete the old
+echo "Gmail Auto Downloader Monitor" and "Gmail Auto Downloader Watchdog" tasks
+echo in Task Scheduler first, then run this file again.
 pause
 exit /b 1

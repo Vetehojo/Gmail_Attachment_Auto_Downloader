@@ -1,3 +1,6 @@
+# requirements.lock を作る元の一覧（直接使うパッケージと許容範囲）。
+# 1_setup.bat と CI はここではなく requirements.lock（全依存の固定版）から入れる。
+# ここを変えたら tools/lock_requirements.py の手順で requirements.lock を作り直す。
 # 下限は各パッケージの最新stable、上限は次のメジャーまで。
 # 最新stableを常に採用できる状態を保ち、破壊的メジャー更新だけを止める。
 google-api-python-client>=2.199,<3

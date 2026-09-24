@@ -23,7 +23,11 @@ class RunnerConsoleWindowTest(unittest.TestCase):
              mock.patch.object(win.subprocess, "run", return_value=completed(3, b"out", b"err")) as run:
             result = win.Runner().run(["schtasks.exe", "/Query"])
         run.assert_called_once_with(
-            ["schtasks.exe", "/Query"], capture_output=True, check=False, creationflags=CREATE_NO_WINDOW
+            ["schtasks.exe", "/Query"],
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            stdin=subprocess.DEVNULL,
         )
         self.assertNotEqual(0, CREATE_NO_WINDOW)
         self.assertEqual(win.CommandResult(3, b"out", b"err"), result)
@@ -33,7 +37,11 @@ class RunnerConsoleWindowTest(unittest.TestCase):
              mock.patch.object(win.subprocess, "run", return_value=completed()) as run:
             win.Runner().run(["schtasks.exe", "/Query"])
         run.assert_called_once_with(
-            ["schtasks.exe", "/Query"], capture_output=True, check=False, creationflags=0
+            ["schtasks.exe", "/Query"],
+            capture_output=True,
+            check=False,
+            creationflags=0,
+            stdin=subprocess.DEVNULL,
         )
 
     def test_console_detection_uses_console_code_page(self):

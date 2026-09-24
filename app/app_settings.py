@@ -1,4 +1,5 @@
 import configparser
+import hashlib
 import json
 import os
 import re
@@ -6,9 +7,11 @@ import shutil
 import subprocess
 from datetime import datetime, timedelta
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(_SCRIPT_DIR, "config.ini")
-STATE_DIR = os.path.join(_SCRIPT_DIR, "state")
+# Install folder = parent of app/. config.ini, state/ and log/ live here, and
+# every module derives its data paths from this one value.
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
+STATE_DIR = os.path.join(BASE_DIR, "state")
 APP_DATA_DIR = (
     os.path.join(os.environ.get("LOCALAPPDATA", STATE_DIR), "GmailAutoDownloader")
     if os.name == "nt"
@@ -169,6 +172,23 @@ def _copy_private_json(source_path, target_path):
         shutil.copy2(source, tmp)
         os.replace(tmp, target)
     protect_private_file(target)
+
+
+def credential_file_digest(auth_mode):
+    """SHA-256 of the installed client JSON (OAuth) or service-account JSON
+    (DWD); "" when it is not installed. Any other OSError propagates (the
+    monitor's ServicePool treats it as "unchanged"). token.json is
+    deliberately not part of it: the monitor refreshes and rewrites that file
+    itself."""
+    path = SERVICE_ACCOUNT_PATH if normalize_auth_mode(auth_mode) == AUTH_DWD else CREDENTIALS_PATH
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError:
+        return ""
+    return digest.hexdigest()
 
 
 def copy_credentials(source_path):

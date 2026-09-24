@@ -1,6 +1,7 @@
 import os
 import re
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock
@@ -634,29 +635,45 @@ class EnqueueMessageJobsTest(unittest.TestCase):
 
 class OrphanTempCleanupTest(unittest.TestCase):
     def test_removes_only_matching_temps_and_leaves_real_files_alone(self):
+        # W2: this installation's temps go at once; another installation's
+        # (other PC sharing the folder) and pre-install-id ".gmailad_*.tmp"
+        # temps only once they are older than FOREIGN_TEMP_MAX_AGE.
         with tempfile.TemporaryDirectory() as td:
             dir_a = os.path.join(td, "A")
             dir_b = os.path.join(td, "B")
             os.makedirs(dir_a)
             os.makedirs(dir_b)
+            own_id = gmail_monitor.installation_id()
+            other_id = "zzzzzz" if own_id != "zzzzzz" else "yyyyyy"
             keep = os.path.join(dir_a, "real_document.pdf")
             with open(keep, "wb") as handle:
                 handle.write(b"keep")
-            orphan_a = os.path.join(dir_a, f"{gmail_monitor.TEMP_PREFIX}1{gmail_monitor.TEMP_SUFFIX}")
-            orphan_b = os.path.join(dir_b, f"{gmail_monitor.TEMP_PREFIX}2{gmail_monitor.TEMP_SUFFIX}")
-            unrelated_tmp = os.path.join(dir_a, "unrelated.tmp")
-            for path in (orphan_a, orphan_b, unrelated_tmp):
+            own_a = os.path.join(dir_a, gmail_monitor.temp_file_name(1))
+            own_b = os.path.join(dir_b, gmail_monitor.temp_file_name(2))
+            foreign_live = os.path.join(dir_a, gmail_monitor.temp_file_name(3, other_id))
+            foreign_old = os.path.join(dir_b, gmail_monitor.temp_file_name(4, other_id))
+            legacy_live = os.path.join(dir_a, ".gmailad_5.tmp")
+            legacy_old = os.path.join(dir_b, ".gmailad_6.tmp")
+            unrelated = [
+                os.path.join(dir_a, "unrelated.tmp"),
+                os.path.join(dir_a, ".gad_notes.txt"),
+                os.path.join(dir_a, f".gad{other_id}_7.pdf"),
+            ]
+            for path in (own_a, own_b, foreign_live, foreign_old, legacy_live, legacy_old, *unrelated):
                 with open(path, "wb") as handle:
                     handle.write(b"junk")
+            old = time.time() - gmail_monitor.FOREIGN_TEMP_MAX_AGE - 60
+            for path in (foreign_old, legacy_old, *unrelated):
+                os.utime(path, (old, old))
 
             # dir_a listed twice: the sweep must not double-count or error on a duplicate.
             removed = gmail_monitor.cleanup_orphan_temp_files([dir_a, dir_b, dir_a])
 
-            self.assertEqual(2, removed)
-            self.assertTrue(os.path.isfile(keep))
-            self.assertFalse(os.path.exists(orphan_a))
-            self.assertFalse(os.path.exists(orphan_b))
-            self.assertTrue(os.path.isfile(unrelated_tmp))
+            self.assertEqual(4, removed)
+            for path in (own_a, own_b, foreign_old, legacy_old):
+                self.assertFalse(os.path.exists(path), path)
+            for path in (keep, foreign_live, legacy_live, *unrelated):
+                self.assertTrue(os.path.isfile(path), path)
 
     def test_missing_and_empty_directories_are_ignored_without_error(self):
         with tempfile.TemporaryDirectory() as td:
