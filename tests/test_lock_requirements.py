@@ -174,10 +174,11 @@ class ParseTest(unittest.TestCase):
 
     def test_the_real_requirements_file_parses_with_ranges(self):
         requirements = lock_requirements.read_requirements(os.path.join(REPO_ROOT, "requirements.txt"))
-        self.assertEqual(6, len(requirements))
+        self.assertEqual(7, len(requirements))
         for name, _extras, clauses, _marker in requirements:
             with self.subTest(name):
-                self.assertEqual([">=", "<"], [op for op, _version in clauses])
+                expected = [">="] if name == "certifi" else [">=", "<"]
+                self.assertEqual(expected, [op for op, _version in clauses])
 
     def test_lock_text(self):
         self.assertEqual(
